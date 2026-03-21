@@ -26,6 +26,107 @@ local _cacheEnabled
 local _maxCachedTexts
 local _hasSetTextProportional = (type(SetTextProportional) == "function")
 
+local _resW, _resH = 1920, 1080
+local _lastAlignment = -1
+
+function Text.SetResolution(w, h)
+    _resW, _resH = w, h
+end
+
+function Text.DrawFast(text, x, y, font, scale, r, g, b, a, alignment)
+    SetTextFont(font)
+    SetTextScale(1.0, scale)
+    SetTextColour(r, g, b, a)
+
+    alignment = alignment or 0
+
+    if alignment == 1 then
+        if _lastAlignment ~= 1 then SetTextCentre(true) end
+    elseif alignment == 2 then
+        if _lastAlignment ~= 2 then
+            SetTextCentre(false)
+            SetTextRightJustify(true)
+        end
+        SetTextWrap(0.0, x / _resW)
+    else
+        if _lastAlignment == 1 then
+            SetTextCentre(false)
+        elseif _lastAlignment == 2 then
+            SetTextRightJustify(false)
+        end
+    end
+    _lastAlignment = alignment
+
+    BeginTextCommandDisplayText("STRING")
+    AddTextComponentSubstringPlayerName(text)
+    EndTextCommandDisplayText(x / _resW, y / _resH)
+end
+
+--- Version ultra-rapide de DrawFast avec positions déjà normalisées (0..1).
+--- nx, ny    : position normalisée pré-calculée (x/_resW, y/_resH dans _Recalculate)
+--- nxWrap    : x/_resW pré-calculé pour SetTextWrap (utilisé si alignment == 2), sinon 0
+--- alignment : 0=gauche (défaut GTA — skip SetTextCentre/RightJustify), 1=centre, 2=droite
+--- Gain vs DrawFast align=0 : -2 natives (SetTextCentre + SetTextRightJustify)
+--- Gain vs DrawFast align=2 : -1 division (nxWrap pré-calculé)
+--- Gain global  : -2 divisions (nx, ny pré-calculées), toujours
+function Text.DrawRaw(text, nx, ny, font, scale, r, g, b, a, alignment, nxWrap)
+    SetTextFont(font)
+    SetTextScale(1.0, scale)
+    SetTextColour(r, g, b, a)
+    if alignment == 1 then
+        if _lastAlignment ~= 1 then SetTextCentre(true) end
+    elseif alignment == 2 then
+        if _lastAlignment ~= 2 then
+            SetTextCentre(false)
+            SetTextRightJustify(true)
+        end
+        SetTextWrap(0.0, nxWrap or nx)
+    else -- alignment == 0
+        if _lastAlignment ~= 0 then
+            SetTextCentre(false)
+            SetTextRightJustify(false)
+        end
+    end
+    _lastAlignment = alignment
+    BeginTextCommandDisplayText("STRING")
+    AddTextComponentSubstringPlayerName(text)
+    EndTextCommandDisplayText(nx, ny)
+end
+
+--- Version shadow ultra-rapide : positions normalisées + valeurs shadow aplaties.
+--- Destinée au titre du header (shadow activé par défaut dans Config).
+--- sDist, sr, sg, sb, sa : valeurs shadow pré-lues depuis Config dans _Recalculate.
+function Text.DrawRawShadow(text, nx, ny, font, scale, r, g, b, a, alignment, sDist, sr, sg, sb, sa)
+    SetTextFont(font)
+    SetTextScale(1.0, scale)
+    SetTextColour(r, g, b, a)
+    if _hasSetTextProportional then SetTextProportional(true) end
+    if alignment == 1 then
+        SetTextCentre(true)
+    elseif alignment == 2 then
+        SetTextCentre(false)        -- reset centre si header l'avait activé
+        SetTextRightJustify(true)
+    else -- alignment == 0
+        SetTextCentre(false)
+        SetTextRightJustify(false)
+    end
+    if _shadowNative == nil then
+        -- initialise l'upvalue (idem ApplyShadow)
+        if type(SetTextDropshadow) == "function" then
+            _shadowNative = SetTextDropshadow
+        elseif type(SetTextDropShadow) == "function" then
+            _shadowNative = SetTextDropShadow
+        else
+            _shadowNative = false
+        end
+    end
+    if _shadowNative then _shadowNative(sDist, sr, sg, sb, sa) end
+    _lastAlignment = alignment
+    BeginTextCommandDisplayText("CELL_EMAIL_BCON")
+    AddTextComponentSubstringPlayerName(text)
+    EndTextCommandDisplayText(nx, ny)
+end
+
 local function EnsureCacheConfig()
     if _cacheEnabled == nil then
         _cacheEnabled = Config and Config.Performance and Config.Performance.enableCache == true

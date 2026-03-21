@@ -41,13 +41,27 @@ end
 --- Change le label de l'item et marque le menu comme dirty (auto-refresh).
 function BaseItem:SetText(text)
 	self.text = text or self.text
-	if self.parent then self.parent._dirty = true end
+	if self.parent then
+		self.parent._dirty = true
+		self.parent._needsRecalculate = true
+	end
 end
 
 --- Change la description et marque le menu comme dirty.
 function BaseItem:SetDescription(desc)
 	self.description = desc or ""
+	self._descFn = nil   -- annule toute description dynamique existante
 	if self.parent then self.parent._dirty = true end
+end
+
+--- Attache une description dynamique — fn(item) est appelée chaque frame.
+---   btn:SetDynDesc(function(item) return "Valeur : " .. myValue end)
+--- Passer nil pour retirer la description dynamique.
+function BaseItem:SetDynDesc(fn)
+	self._descFn = fn
+	if fn then
+		self.description = fn(self)   -- calcul immédiat pour la valeur initiale
+	end
 end
 
 --- Active/désactive l'item et marque le menu comme dirty.
@@ -61,7 +75,7 @@ end
 function BaseItem:Destroy()
 	if self.OnActivated then self.OnActivated.Clear() end
 	if self.OnProgressChanged then self.OnProgressChanged.Clear() end
-	if self.OnSliderChanged then self.OnSliderChanged.Clear() end
+	-- OnSliderChanged removed (heritage now uses OnProgressChanged)
 	if self.OnCheckboxChange then self.OnCheckboxChange.Clear() end
 	if self.OnListChanged then self.OnListChanged.Clear() end
 	self.parent = nil
@@ -126,7 +140,6 @@ function BaseItem:SetValue(value)
 	if clamped ~= self.value then
 		self.value = clamped
 		if self.OnProgressChanged then self.OnProgressChanged.Emit(self, self.value, self.max) end
-		if self.OnSliderChanged then self.OnSliderChanged.Emit(self, self.value) end
 	end
 end
 
@@ -140,7 +153,7 @@ end
 --- Retourne le step (incrémentation par pression gauche/droite).
 ---@return number
 function BaseItem:GetStep()
-	local step = self.style and tonumber(self.style.step)
+	local step = self._step or (self.style and tonumber(self.style.step))
 	if not step or step <= 0 then step = 1 end
 	return step
 end

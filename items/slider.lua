@@ -1,5 +1,5 @@
 -- items/slider.lua
--- HÃ©rite de BaseItem. Barre de progression contrÃ´lÃ©e avec Left/Right.
+-- Herite de BaseItem. Barre de progression controlee avec Left/Right.
 
 UIMenuSliderProgress = setmetatable({}, { __index = BaseItem })
 UIMenuSliderProgress.__index = UIMenuSliderProgress
@@ -8,25 +8,23 @@ UIMenuSliderProgress.__index = UIMenuSliderProgress
 ---@param progressStart number
 ---@param progressMax number
 ---@param description string
----@param style table|nil
 ---@param enabled boolean|nil
----@param actions table|nil
-function UIMenuSliderProgress.New(text, progressStart, progressMax, description, style, enabled, actions)
+---@param actions table|nil   { onSelect=fn, onChange=fn, step=number }
+function UIMenuSliderProgress.New(text, progressStart, progressMax, description, enabled, actions)
 	local self = BaseItem.New(UIMenuSliderProgress, "sliderprogress", text, description, enabled)
 
 	self.max = tonumber(progressMax) or 100
 	if self.max < 0 then self.max = 0 end
 	self.min = 0
 	self.value = BaseItem.Clamp(tonumber(progressStart) or 0, self.min, self.max)
-	self.style = style or {}
+	self._step = (actions and tonumber(actions.step)) or 1
 
 	self.OnProgressChanged = Event.New()
 
-	-- Callbacks optionnels (style RageUI)
 	if actions then
-		if type(actions.onSelected) == "function" then
+		if type(actions.onSelect) == "function" then
 			self.OnActivated.On(function()
-				actions.onSelected(self, self.value, self.max)
+				actions.onSelect(self, self.value, self.max)
 			end)
 		end
 		if type(actions.onChange) == "function" then
@@ -39,28 +37,68 @@ function UIMenuSliderProgress.New(text, progressStart, progressMax, description,
 	return self
 end
 
--- SetEnabled, SetMax, SetValue, GetStep, Next, Prev â†’ tous hÃ©ritÃ©s de BaseItem
+-- SetEnabled, SetMax, SetValue, GetStep, Next, Prev → tous hérités de BaseItem
 
--- Upvalues: Ã©vite les lookups Config rÃ©pÃ©tÃ©s par frame
-local _sliderCfg    -- cache Config.SliderProgress
-local _sliderMenuW  -- cache Config.Header.size.width
-local _sliderItemH  -- cache itemHeight
+-- Upvalues: fallback si DrawCustom appelé sans pré-calcul
+local _sliderCfg, _sliderMenuW, _sliderItemH
 
 local function SliderCfg()
 	if not _sliderCfg then
-		_sliderCfg  = Config.SliderProgress or {}
+		_sliderCfg   = Config.SliderProgress or {}
 		_sliderMenuW = Config.Header.size.width
 		_sliderItemH = (Config.Layout and Config.Layout.itemHeight) or 35
 	end
 	return _sliderCfg, _sliderMenuW, _sliderItemH
 end
 
-function UIMenuSliderProgress:DrawCustom(x, y, isSelected)
+---@param x          number
+---@param y          number
+---@param isSelected boolean
+---@param invW       number|nil  1/resW pre-calcule
+---@param invH       number|nil  1/resH pre-calcule
+function UIMenuSliderProgress:DrawCustom(x, y, isSelected, invW, invH)
+	if not invW or not invH then
+		invW, invH = Draw.GetInvScale()
+	end
+
+	local isEnabled = (self.enabled == nil) and true or self.enabled
+
+	-- Chemin optimise : valeurs pre-calculees dans _Recalculate
+	if self._barNX then
+		local barNY = y * invH + self._barNYOff
+		local ratio = (self.max > 0) and (self.value / self.max) or 0
+		if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
+
+		local bgR, bgG, bgB, bgA, fiR, fiG, fiB, fiA
+		if not isEnabled then
+			bgR, bgG, bgB, bgA = self._barBgDR, self._barBgDG, self._barBgDB, self._barBgDA
+			fiR, fiG, fiB, fiA = self._barFiDR, self._barFiDG, self._barFiDB, self._barFiDA
+		elseif isSelected then
+			bgR, bgG, bgB, bgA = self._barBgSR, self._barBgSG, self._barBgSB, self._barBgSA
+			fiR, fiG, fiB, fiA = self._barFiSR, self._barFiSG, self._barFiSB, self._barFiSA
+		else
+			bgR, bgG, bgB, bgA = self._barBgR, self._barBgG, self._barBgB, self._barBgA
+			fiR, fiG, fiB, fiA = self._barFiR, self._barFiG, self._barFiB, self._barFiA
+		end
+
+		-- Fond
+		Draw.RectRaw(self._barNX, barNY, self._barNW, self._barNH, bgR, bgG, bgB, bgA)
+
+		-- Fill (aligne a gauche du fond)
+		local fillNW = self._barNW * ratio
+		if fillNW > 0 then
+			local fillNX = self._barNX - self._barNW * 0.5 + fillNW * 0.5
+			Draw.RectRaw(fillNX, barNY, fillNW, self._barNH, fiR, fiG, fiB, fiA)
+		end
+		return
+	end
+
+	-- Fallback non-optimise (avant premier _Recalculate)
 	local cfg, menuWidth, itemHeight = SliderCfg()
 	local bar = cfg.bar or {}
 
-	local width   = tonumber(self.style.width) or bar.width or 120
-	local barH    = tonumber(self.style.height) or tonumber(bar.height) or 8
+	local width   = bar.width or 120
+	local barH    = tonumber(bar.height) or 8
 	local rectCfg = bar.rectangle
 	if rectCfg then
 		local bk = rectCfg.black
@@ -75,27 +113,17 @@ function UIMenuSliderProgress:DrawCustom(x, y, isSelected)
 	local barX = x + menuWidth - offsetRightX - width
 	local barY = y + offsetY
 
-	local isEnabled = (self.enabled == nil) and true or self.enabled
 	local colors = bar.color or {}
-
-	-- ZERO-ALLOC: pas de table temporaire
 	local bgColor   = BaseItem.ResolveColor(colors.background,   colors.backgroundSelected,   colors.backgroundDisabled,   isEnabled, isSelected)
 	local fillColor = BaseItem.ResolveColor(colors.fill,         colors.fillSelected,         colors.fillDisabled,         isEnabled, isSelected)
 
-	-- Background bar
-	if bgColor then
-		Draw.Rect(barX, barY, width, barH, bgColor)
-	end
+	if bgColor then Draw.Rect(barX, barY, width, barH, bgColor) end
 
-	-- Fill
 	local ratio = (self.max > 0) and (self.value / self.max) or 0
 	if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
 	local fillW = width * ratio
-	if fillW > 0 and fillColor then
-		Draw.Rect(barX, barY, fillW, barH, fillColor)
-	end
+	if fillW > 0 and fillColor then Draw.Rect(barX, barY, fillW, barH, fillColor) end
 
-	-- Optionnel: value text Ã  droite
 	if bar.showValue == true then
 		local valueText = string.format("%d/%d", math.floor(self.value), math.floor(self.max))
 		local valueCfg = cfg.value or {}

@@ -17,6 +17,9 @@ function Cache.Init()
         width = Config.BaseResolution.height * Cache.aspectRatio,
         height = Config.BaseResolution.height
     }
+    if Text and Text.SetResolution then
+        Text.SetResolution(Cache.resolution.width, Cache.resolution.height)
+    end
 end
 
 function Cache.Update()
@@ -30,6 +33,9 @@ function Cache.Update()
     if newAspectRatio ~= Cache.aspectRatio then
         Cache.aspectRatio = newAspectRatio
         Cache.resolution.width = Config.BaseResolution.height * Cache.aspectRatio
+        if Text and Text.SetResolution then
+            Text.SetResolution(Cache.resolution.width, Cache.resolution.height)
+        end
         Cache.InvalidateAll()
     end
 end

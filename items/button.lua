@@ -8,33 +8,13 @@
 --   end)
 --   menu:AddItem(btn)
 
---[[UIMenuButton = setmetatable({}, { __index = BaseItem })
-UIMenuButton.__index = UIMenuButton
-
----@param text string|nil         Label du bouton
----@param description string|nil  Description affichée en bas du menu
----@param enabled boolean|nil     true par défaut
----@param callback function|nil   Fonction appelée quand le bouton est activé (Enter)
----@return table  instance UIMenuButton
-function UIMenuButton.New(text, description, enabled, callback)
-    local self = BaseItem.New(UIMenuButton, "button", text, description, enabled)
-
-    self.submenu = nil -- placeholder pour plus tard (sous-menu)
-
-    if type(callback) == "function" then
-        self.OnActivated.On(callback)
-    end
-
-    return self
-end
-
 -- Pas de DrawCustom() pour l'instant (le label est déjà dessiné par menu.lua)
 -- Plus tard: dessiner une flèche "→" à droite si self.submenu ~= nil
 
 -- Alias de compatibilité
-DrawButton = UIMenuButton
+--DrawButton = UIMenuButton
 
-return UIMenuButton]]
+--return UIMenuButton]]
 
 
 -- items/button.lua
@@ -66,6 +46,56 @@ function UIMenuButton.New(text, description, enabled, actions)
     end
 
     return self
+end
+
+--- Dessine les badges et le rightLabel (appelé par menu.lua après le label standard)
+---@param x          number   coin gauche du menu (px)
+---@param y          number   coin haut de l'item (px)
+---@param isSelected boolean
+---@param invW       number   1/screenWidth
+---@param invH       number   1/screenHeight
+function UIMenuButton:DrawCustom(_x, y, isSelected, invW, invH)
+    if not self.rightBadge and not self.leftBadge and not self.rightLabel then return end
+    if not invW or not invH then invW, invH = Draw.GetInvScale() end
+
+    local isEnabled = (self.enabled == nil) and true or self.enabled
+    local badgeY    = y * invH + (self._badgeNYOff or 0)
+
+    -- ─── Left Badge ──────────────────────────────────────────────────────────
+    if self.leftBadge and self._badgeLeftNX then
+        local bd = type(self.leftBadge) == "function" and self.leftBadge(isSelected) or nil
+        if bd and bd.texture and bd.texture ~= "" then
+            local c = bd.color
+            Draw.SpriteRaw(bd.dict, bd.texture,
+                self._badgeLeftNX, badgeY, self._badgeNW, self._badgeNH,
+                0.0, c.r, c.g, c.b, c.a)
+        end
+    end
+
+    -- ─── Right Badge ─────────────────────────────────────────────────────────
+    if self.rightBadge and self._badgeRightNX then
+        local bd = type(self.rightBadge) == "function" and self.rightBadge(isSelected) or nil
+        if bd and bd.texture and bd.texture ~= "" then
+            local c = bd.color
+            Draw.SpriteRaw(bd.dict, bd.texture,
+                self._badgeRightNX, badgeY, self._badgeNW, self._badgeNH,
+                0.0, c.r, c.g, c.b, c.a)
+        end
+    end
+
+    -- ─── Right Label ─────────────────────────────────────────────────────────
+    if self.rightLabel and self._rlNX then
+        local lCfg    = (Config.Button and Config.Button.label) or {}
+        local colorSet = lCfg.color or {}
+        local col = isSelected and colorSet.selected
+               or  (isEnabled  and colorSet.default)
+               or  colorSet.disabled
+               or  { r=245, g=242, b=242, a=255 }
+        Text.DrawRaw(tostring(self.rightLabel), self._rlNX,
+            y * invH + (self._textNYOff or 0),
+            lCfg.font or 0, lCfg.size or 0.26,
+            col.r, col.g, col.b, col.a, 2)
+    end
 end
 
 DrawButton = UIMenuButton

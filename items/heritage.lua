@@ -1,13 +1,6 @@
 -- items/heritage.lua
--- Hérite de BaseItem. Slider "héritage" avec icônes female/male et fill-from-center.
+-- Herite de BaseItem. Slider "heritage" avec icones female/male et fill-from-center.
 
-local ITEM_HEIGHT = (Config.Layout and Config.Layout.itemHeight) or 35
-
-local function GetItemHeight()
-    return (Config.Layout and Config.Layout.itemHeight) or 35
-end
--- Puis remplacer ITEM_HEIGHT par GetItemHeight() dans DrawCustom
--- OU: utiliser le même pattern upvalue que les autres items
 local _heriCfg, _heriItemH
 local function HeriCfg()
     if not _heriCfg then
@@ -24,30 +17,27 @@ UIMenuSliderHeritageItem.__index = UIMenuSliderHeritageItem
 ---@param min number|nil
 ---@param max number|nil
 ---@param value number|nil
----@param step number|nil
 ---@param description string|nil
----@param style table|nil
 ---@param enabled boolean|nil
----@param actions table|nil
-function UIMenuSliderHeritageItem.New(text, min, max, value, step, description, style, enabled, actions)
+---@param actions table|nil   { step=number, onSelect=fn, onChange=fn }
+function UIMenuSliderHeritageItem.New(text, min, max, value, description, enabled, actions)
     local self = BaseItem.New(UIMenuSliderHeritageItem, "heritage", text, description, enabled)
 
-    self.min = min or 0
-    self.max = max or 100
+    self.min   = min   or 0
+    self.max   = max   or 100
     self.value = value or 0
-    self.style = style or { step = step or 1 }
-    if not self.style.step then self.style.step = step or 1 end
+    self._step = (actions and tonumber(actions.step)) or 1
 
-    self.OnSliderChanged = Event.New()
+    self.OnProgressChanged = Event.New()
 
     if actions then
-        if type(actions.onSelected) == "function" then
+        if type(actions.onSelect) == "function" then
             self.OnActivated.On(function()
-                actions.onSelected(self, self.value, self.max)
+                actions.onSelect(self, self.value, self.max)
             end)
         end
         if type(actions.onChange) == "function" then
-            self.OnSliderChanged.On(function(_, val)
+            self.OnProgressChanged.On(function(_, val)
                 actions.onChange(self, val)
             end)
         end
@@ -58,33 +48,102 @@ end
 
 -- Next, Prev, SetValue, SetMax, GetStep → hérités de BaseItem
 
-function UIMenuSliderHeritageItem:DrawCustom(x, y, selected)
-    local C = Config and Config.Heritage or {}
-    local H = Config and Config.Header or {size={width=431}}
+---@param x          number
+---@param y          number
+---@param selected   boolean
+---@param invW       number|nil  1/resW pre-calcule
+---@param invH       number|nil  1/resH pre-calcule
+function UIMenuSliderHeritageItem:DrawCustom(x, y, selected, invW, invH)
+    if not invW or not invH then
+        invW, invH = Draw.GetInvScale()
+    end
 
     local isEnabled = (self.enabled == nil) and true or self.enabled
 
-    -- Dimensions
-    local icon = tonumber(C.icons and C.icons.size) or 20
-    local gap  = tonumber(C.icons and C.icons.gap)  or 6
-    local barW = tonumber(C.bar and C.bar.width)     or 120
-    local barH = tonumber(C.bar and C.bar.height)    or 8
-    local menuW   = tonumber(H.size and H.size.width) or 431
+    -- Chemin optimise : valeurs pre-calculees dans _Recalculate
+    if self._hBarNX then
+        local barNY = y * invH + self._hBarNYOff
+
+        -- 1. Fond barre
+        Draw.RectRaw(self._hBarNX, barNY, self._hBarNW, self._hBarNH,
+            self._hBarBgR, self._hBarBgG, self._hBarBgB, self._hBarBgA)
+
+        -- 2. Fill from center
+        local range     = self.max - self.min
+        local centerVal = self._hCenterVal or ((self.min + self.max) * 0.5)
+        local pct       = (range > 0) and ((self.value  - self.min) / range) or 0
+        local centerPct = (range > 0) and ((centerVal   - self.min) / range) or 0.5
+        if pct     < 0 then pct     = 0 elseif pct     > 1 then pct     = 1 end
+        if centerPct < 0 then centerPct = 0 elseif centerPct > 1 then centerPct = 1 end
+
+        -- Conversion en coordonnees normalisees depuis les extremes de la barre
+        local barLeft  = self._hBarNX - self._hBarNW * 0.5
+        local centerNX = barLeft + self._hBarNW * centerPct
+        local valueNX  = barLeft + self._hBarNW * pct
+
+        local fillNX, fillNW
+        if valueNX >= centerNX then
+            fillNW = valueNX - centerNX
+            fillNX = centerNX + fillNW * 0.5
+        else
+            fillNW = centerNX - valueNX
+            fillNX = valueNX  + fillNW * 0.5
+        end
+
+        if fillNW > 0 then
+            Draw.RectRaw(fillNX, barNY, fillNW, self._hBarNH,
+                self._hBarFiR, self._hBarFiG, self._hBarFiB, self._hBarFiA)
+        end
+
+        -- 3. Divider (centre fixe)
+        local divNY = y * invH + self._hDivNYOff
+        local divR, divG, divB, divA
+        if selected then
+            divR, divG, divB, divA = self._hDivSelR, self._hDivSelG, self._hDivSelB, self._hDivSelA
+        else
+            divR, divG, divB, divA = self._hDivDefR, self._hDivDefG, self._hDivDefB, self._hDivDefA
+        end
+        local divCenterNX = self._hBarNX  -- centre de la barre = centre du diviseur
+        Draw.RectRaw(divCenterNX, divNY, self._hDivNW, self._hDivNH, divR, divG, divB, divA)
+
+        -- 4. Icones female/male
+        local iconNY = y * invH + self._hIconNYOff
+        local fR, fG, fB, fA, mR, mG, mB, mA
+        if selected then
+            fR, fG, fB, fA = self._hFemSelR, self._hFemSelG, self._hFemSelB, self._hFemSelA
+            mR, mG, mB, mA = self._hMalSelR, self._hMalSelG, self._hMalSelB, self._hMalSelA
+        else
+            fR, fG, fB, fA = self._hFemDefR, self._hFemDefG, self._hFemDefB, self._hFemDefA
+            mR, mG, mB, mA = self._hMalDefR, self._hMalDefG, self._hMalDefB, self._hMalDefA
+        end
+        Draw.SpriteRaw(self._hIconDict, self._hIconLeft,
+            self._hIconLeftNX,  iconNY, self._hIconNW, self._hIconNH, 0.0, fR, fG, fB, fA)
+        Draw.SpriteRaw(self._hIconDict, self._hIconRight,
+            self._hIconRightNX, iconNY, self._hIconNW, self._hIconNH, 0.0, mR, mG, mB, mA)
+        return
+    end
+
+    -- Fallback non-optimise (avant premier _Recalculate)
+    local C, itemHeight = HeriCfg()
+    local H = Config and Config.Header or {size={width=431}}
+
+    local icon  = tonumber(C.icons and C.icons.size) or 20
+    local gap   = tonumber(C.icons and C.icons.gap)  or 6
+    local barW  = tonumber(C.bar and C.bar.width)     or 120
+    local barH  = tonumber(C.bar and C.bar.height)    or 8
+    local menuW = tonumber(H.size and H.size.width)   or 431
     local offsetX = tonumber(C.offsetRightX) or 12
 
-    -- Position (right-aligned inside menu)
     local rightEdge = x + menuW - offsetX
     local barX = rightEdge - icon - gap - barW
-    local by   = y + (ITEM_HEIGHT - barH) * 0.5
+    local by   = y + (itemHeight - barH) * 0.5
 
-    -- 1. Background bar (ZERO-ALLOC)
     local barC = C.bar and C.bar.color or {}
-    local bg = BaseItem.ResolveColor(barC.background, barC.backgroundSelected, barC.backgroundDisabled, isEnabled, selected)
+    local bg   = BaseItem.ResolveColor(barC.background, barC.backgroundSelected, barC.backgroundDisabled, isEnabled, selected)
     if not bg then bg = {r=93,g=182,b=229,a=255} end
     Draw.Rect(barX, by, barW, barH, bg)
 
-    -- 2. Fill from center
-    local range    = self.max - self.min
+    local range     = self.max - self.min
     local centerVal = (C.bar and C.bar.centerValue) or ((self.min + self.max) * 0.5)
     local pct       = (range > 0) and ((self.value  - self.min) / range) or 0
     local centerPct = (range > 0) and ((centerVal   - self.min) / range) or 0.5
@@ -107,30 +166,26 @@ function UIMenuSliderHeritageItem:DrawCustom(x, y, selected)
         Draw.Rect(fillX, by, fillW, barH, fCol)
     end
 
-    -- 3. Divider (FIXED at center, drawn on top)
     local div  = C.divider or {}
     local dW   = tonumber(div.width)  or 2
     local dH   = tonumber(div.height) or 20
     local dCol = BaseItem.GetColor(div.color, isEnabled, selected) or {r=0,g=0,b=0,a=255}
-
-    local halfBar = barW * 0.5
-    local centerX = barX + halfBar
+    local centerX = barX + barW * 0.5
     local divX = centerX - (dW * 0.5)
     local divY = by + (barH - dH) * 0.5
     Draw.Rect(divX, divY, dW, dH, dCol)
 
-    -- 4. Icons (couleurs séparées female / male, ZERO-ALLOC)
     local ics  = C.icons or {}
     local dict = ics.dict or "mpleaderboard"
     local icC  = ics.color or {}
     local fC   = icC.female or {}
     local mC   = icC.male   or {}
     local _defaultWhite = {r=255,g=255,b=255,a=255}
-    local fCol = (selected and fC.selected or fC.default) or _defaultWhite
-    local mCol = (selected and mC.selected or mC.default) or _defaultWhite
-    local iy   = y + (ITEM_HEIGHT - icon) * 0.5
-    Draw.Sprite(dict, ics.left  or "leaderboard_female_icon", barX - gap - icon, iy, icon, icon, 0, fCol.r, fCol.g, fCol.b, fCol.a)
-    Draw.Sprite(dict, ics.right or "leaderboard_male_icon",   barX + barW + gap,  iy, icon, icon, 0, mCol.r, mCol.g, mCol.b, mCol.a)
+    local fColT = (selected and fC.selected or fC.default) or _defaultWhite
+    local mColT = (selected and mC.selected or mC.default) or _defaultWhite
+    local iy = y + (itemHeight - icon) * 0.5
+    Draw.Sprite(dict, ics.left  or "leaderboard_female_icon", barX - gap - icon, iy, icon, icon, 0, fColT.r, fColT.g, fColT.b, fColT.a)
+    Draw.Sprite(dict, ics.right or "leaderboard_male_icon",   barX + barW + gap,  iy, icon, icon, 0, mColT.r, mColT.g, mColT.b, mColT.a)
 end
 
 -- Alias de compatibilité

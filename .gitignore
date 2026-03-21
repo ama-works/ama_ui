@@ -2,3 +2,5 @@ node_modules/
 nui/
 doc/
 doc.zip
+panels/screen/
+*.png

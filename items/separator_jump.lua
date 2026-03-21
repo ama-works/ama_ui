@@ -5,6 +5,19 @@
 UIMenuSeparatorJump = setmetatable({}, { __index = BaseItem })
 UIMenuSeparatorJump.__index = UIMenuSeparatorJump
 
+local _sepMenuW, _sepLabelFont, _sepLabelSize, _sepLabelColor, _sepLabelOffY
+local function SepCfg()
+    if not _sepMenuW then
+        local C = Config and Config.Separator or {}
+        _sepMenuW      = (Config and Config.Header and Config.Header.size and Config.Header.size.width) or 431
+        local label    = C.label or {}
+        _sepLabelFont  = label.font  or 0
+        _sepLabelSize  = label.size  or 0.26
+        _sepLabelColor = label.color or { r = 200, g = 200, b = 200, a = 255 }
+        _sepLabelOffY  = label.offsetY or 7
+    end
+end
+
 function UIMenuSeparatorJump.New(text)
     local self = BaseItem.New(UIMenuSeparatorJump, "separator_jump", text, "", false)
     self.isSeparator = true  -- flag pour le skip de navigation
@@ -12,40 +25,10 @@ function UIMenuSeparatorJump.New(text)
 end
 
 function UIMenuSeparatorJump:DrawCustom(x, y, selected)
-    local C = Config and Config.Separator or {}
-    local H = Config and Config.Header or { size = { width = 431 } }
-    local menuW = tonumber(H.size and H.size.width) or 431
-
-    -- Ligne horizontale (optionnelle)
-    --local line = C.line or {}
-    --if line.enabled ~= false then
-      ---  local lW = tonumber(line.width) or menuW
-        --local lH = tonumber(line.height) or 1
-        --local lCol = line.color or { r = 100, g = 100, b = 100, a = 200 }
-
-        --local lX = x + (menuW - lW) * 0.5
-        --local lY = y + (38 - lH) * 0.5
-       -- Draw.Rect(lX, lY, lW, lH, lCol)
-    --end
-
-    -- Label centré (optionnel)
-    if self.text ~= "" then
-        local label = C.label or {}
-        local font  = label.font or 0
-        local size  = label.size or 0.26
-        local color = label.color or { r = 200, g = 200, b = 200, a = 255 }
-        local oY    = label.offsetY or 7
-
-        Text.Draw(
-            self.text,
-            x + menuW * 0.5,
-            y + oY,
-            font,
-            size,
-            color,
-            Text.Align.Center
-        )
-    end
+    if self.text == "" then return end
+    SepCfg()
+    Text.Draw(self.text, x + _sepMenuW * 0.5, y + _sepLabelOffY,
+        _sepLabelFont, _sepLabelSize, _sepLabelColor, Text.Align.Center)
 end
 
 DrawSeparatorJump = UIMenuSeparatorJump

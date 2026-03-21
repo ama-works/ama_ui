@@ -63,13 +63,16 @@ end
 --- @param colorA Première couleur (table avec r, g, b, a)
 --- @param colorB Deuxième couleur (table avec r, g, b, a)
 --- @param t Valeur d'interpolation (0-1)
-function Colors.Lerp(colorA, colorB, t)
-    return {
-        r = math.floor(colorA.r + (colorB.r - colorA.r) * t),
-        g = math.floor(colorA.g + (colorB.g - colorA.g) * t),
-        b = math.floor(colorA.b + (colorB.b - colorA.b) * t),
-        a = math.floor(colorA.a + (colorB.a - colorA.a) * t)
-    }
+--- @param out Table de sortie optionnelle (réutilisation pour éviter l'allocation)
+local _lerpResult = { r = 0, g = 0, b = 0, a = 255 }
+
+function Colors.Lerp(colorA, colorB, t, out)
+    out = out or _lerpResult
+    out.r = math.floor(colorA.r + (colorB.r - colorA.r) * t + 0.5)
+    out.g = math.floor(colorA.g + (colorB.g - colorA.g) * t + 0.5)
+    out.b = math.floor(colorA.b + (colorB.b - colorA.b) * t + 0.5)
+    out.a = math.floor(colorA.a + (colorB.a - colorA.a) * t + 0.5)
+    return out
 end
 
 -- Copier une couleur

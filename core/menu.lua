@@ -1,7 +1,23 @@
----@diagnostic disable: missing-parameter
+
 -- core/menu.lua
 Menu = {}
 Menu.__index = Menu
+
+-- Wrappers locaux vers les fonctions Raw de draw.lua / text.lua.
+-- Déclarés comme fonctions (jamais nil) pour satisfaire l'analyse statique.
+-- draw.lua et text.lua sont chargés avant menu.lua dans fxmanifest.
+local function _fnSpriteRaw(dict, name, nx, ny, nw, nh, heading, r, g, b, a)
+    return Draw.SpriteRaw(dict, name, nx, ny, nw, nh, heading, r, g, b, a)
+end
+local function _fnRectRaw(nx, ny, nw, nh, r, g, b, a)
+    Draw.RectRaw(nx, ny, nw, nh, r, g, b, a)
+end
+local function _fnDrawRaw(text, nx, ny, font, scale, r, g, b, a, alignment, nxWrap)
+    Text.DrawRaw(text, nx, ny, font, scale, r, g, b, a, alignment, nxWrap)
+end
+local function _fnDrawRawShadow(text, nx, ny, font, scale, r, g, b, a, alignment, sDist, sr, sg, sb, sa)
+    Text.DrawRawShadow(text, nx, ny, font, scale, r, g, b, a, alignment, sDist, sr, sg, sb, sa)
+end
 
 
 ---@param title string
@@ -11,7 +27,7 @@ Menu.__index = Menu
 -- CrÃ©er un nouveau menu
 function Menu.New(title, subtitle, x, y)
     local self = setmetatable({}, Menu)
-    
+
     -- ID unique
     self.id = GenerateUUID()
     
@@ -83,6 +99,9 @@ function Menu.New(title, subtitle, x, y)
     self._descMeasureParamsKey = nil
     self._descMeasureParams = nil
 
+    -- Panels (style RageUI) — stocke la closure passée via menu:SetPanels(fn)
+    self._panelsFn = nil
+
     -- Cache positions header/subtitle (rempli par _Recalculate, jamais recomputed en Draw)
     self._titleX    = nil
     self._titleY    = nil
@@ -92,6 +111,30 @@ function Menu.New(title, subtitle, x, y)
     self._counterY  = nil
     -- Counter text precalcule (mis a jour par _UpdateCounter, pas par frame)
     self._counterText = nil
+
+    -- Cache dimensions (évite 13× lookups Config par frame)
+    self._menuWidth      = Config.Header.size.width
+    self._headerHeight   = Config.Header.size.height
+    self._subtitleHeight = Config.Subtitle.size.height
+    self._itemHeight     = (Config.Layout and Config.Layout.itemHeight) or 35
+
+    -- Cache config par type d'item (évite GetItemTypeConfig() par item par frame)
+    self._itemTypeCfg = {
+        list          = Config.List          or Config.Button,
+        checkbox      = Config.Checkbox      or Config.Button,
+        sliderprogress= Config.SliderProgress or Config.Button,
+        heritage      = Config.Heritage      or Config.SliderProgress or Config.Button,
+        progress      = Config.Progress      or Config.Button,
+        button        = Config.Button,
+        window        = {},
+        panel         = {},
+        separator     = Config.Separator     or {},
+    }
+
+    -- Cache indices/hauteur visibles (mis à jour par _UpdateVisibleRange)
+    self._visibleStart       = 1
+    self._visibleEnd         = 1
+    self._visibleTotalHeight = 0
 
     return self
 end
@@ -136,8 +179,15 @@ end
 -- onChecked / onUnChecked → onChange (Checkbox)
 -- ============================================================================
 local function NormalizeActions(actions)
-    if not actions or type(actions) ~= "table" then return actions end
+    if not actions or type(actions) ~= "table" then return nil end
+    -- ⚡ Early-return si aucune clé pertinente (évite de créer une table vide)
+    if not (actions.onSelected or actions.onSelect or actions.onListChange
+        or actions.onSliderChange or actions.onChange
+        or actions.onChecked or actions.onUnChecked or actions.step) then
+        return nil
+    end
     local n = {}
+    if actions.step then n.step = tonumber(actions.step) end
 
     if type(actions.onSelected) == "function" then
         n.onSelect = actions.onSelected
@@ -182,7 +232,8 @@ function Menu:Button(label, description, optsOrActions, extra)
     local submenu    = extra
     local rightLabel = nil
 
-    if type(optsOrActions) == "table" and optsOrActions.RightLabel ~= nil then
+    if type(optsOrActions) == "table" and
+       (optsOrActions.RightLabel ~= nil or optsOrActions.RightBadge ~= nil or optsOrActions.LeftBadge ~= nil) then
         rightLabel = optsOrActions.RightLabel
         actions    = extra
         submenu    = nil
@@ -193,8 +244,10 @@ function Menu:Button(label, description, optsOrActions, extra)
 
     local item = self:AddItem(UIMenuButton.New(label, description, true, NormalizeActions(actions)))
 
-    if rightLabel then
-        item.rightLabel = rightLabel
+    if rightLabel then item.rightLabel = rightLabel end
+    if type(optsOrActions) == "table" then
+        if optsOrActions.RightBadge ~= nil then item.rightBadge = optsOrActions.RightBadge; self._needsRecalculate = true end
+        if optsOrActions.LeftBadge  ~= nil then item.leftBadge  = optsOrActions.LeftBadge;  self._needsRecalculate = true end
     end
 
     if submenu and submenu.id then
@@ -213,90 +266,60 @@ end
 ---@param items       table
 ---@param index       number|nil
 ---@param description string|nil
+---@param enabled     boolean|nil
 ---@param actions     table|nil   { onChange=fn, onSelect=fn }
-function Menu:List(label, items, index, description, actions)
-    return self:AddItem(UIMenuList.New(label, items, index, description, NormalizeActions(actions)))
+function Menu:List(label, items, index, description, enabled, actions)
+    return self:AddItem(UIMenuList.New(label, items, index, description, enabled, NormalizeActions(actions)))
 end
 
---- Case à cocher
---- Note: checked est un booléen indiquant si la case est cochée ou non. Si actions.onChange est défini, il sera appelé lorsque l'utilisateur change l'état de la case à cocher, avec le menu, l'item et la nouvelle valeur (true/false) en paramètre. Si actions.onSelect est défini, il sera appelé lorsque l'item est sélectionné, avec le menu, l'item et la valeur actuelle en paramètre.
--- Exemple d'utilisation: myMenu:Checkbox("Enable Sound", true, "Toggle game sound", { onChange = function(menu, item, newValue) print("Sound enabled: " .. tostring(newValue)) end })
--- Note: pour les cases à cocher, on peut aussi gérer un état "indéterminé" (nil) si on veut représenter une option qui n'est pas simplement binaire. Dans ce cas, checked peut être un booléen ou nil, et le code de l'item Checkbox doit être adapté pour gérer cette possibilité. Cependant, dans la version actuelle, on suppose que checked est un booléen simple.
 ---@param text        string
 ---@param checked     boolean|nil
 ---@param description string|nil
+---@param enabled     boolean|nil
 ---@param actions     table|nil   { onChange=fn, onSelect=fn }
-function Menu:Checkbox(label, checked, description, actions)
-    return self:AddItem(UIMenuCheckbox.New(label, checked, description, NormalizeActions(actions)))
+function Menu:Checkbox(label, checked, description, enabled, actions)
+    return self:AddItem(UIMenuCheckbox.New(label, checked, description, enabled, NormalizeActions(actions)))
 end
 
--- slider de progression (ex: barre de santé, d'armure, etc.)
--- Note: progressStart est la valeur actuelle de la progression, progressMax est la valeur maximale. Si actions.onChange est défini, il sera appelé lorsque l'utilisateur change la valeur du slider, avec le menu, l'item et la nouvelle valeur en paramètre. Si actions.onSelect est défini, il sera appelé lorsque l'item est sélectionné, avec le menu, l'item et la valeur actuelle en paramètre.
--- exemple d'utilisation: myMenu:SliderProgress("Health", 75, 100, "Current health", { onChange = function(menu, item, newValue) print("New health: " .. newValue) end })
---- @param text string
---- @param progressStart number
---- @param progressMax number
---- @param description string
---- @param style table (optionnel, pour config spécifique a ce slider)
---- @param enabled boolean (optionnel, dÃ©faut true)
---- @param actions table (optionnel, pour override les actions par defaut de ce slider)
--- myMenu:SliderProgress("label", 10, 100, "desc", style, enabled, actions)
-function Menu:SliderProgress(label, progressStart, progressMax, description, style, enabled, actions)
-    return self:AddItem(UIMenuSliderProgress.New(label, progressStart, progressMax, description, style, enabled, NormalizeActions(actions)))
+---@param label        string
+---@param progressStart number
+---@param progressMax   number
+---@param description   string|nil
+---@param enabled       boolean|nil
+---@param actions       table|nil   { step=number, onChange=fn, onSelect=fn }
+function Menu:SliderProgress(label, progressStart, progressMax, description, enabled, actions)
+    return self:AddItem(UIMenuSliderProgress.New(label, progressStart, progressMax, description, enabled, NormalizeActions(actions)))
 end
 
---- Alias simplifié de SliderProgress.
--- menu:Slider("label", 50, 100, "desc", { step=5 }, { onSliderChange = fn })
 ---@param label        string
 ---@param value        number
 ---@param max          number
 ---@param description  string|nil
----@param style        table|nil
----@param actions      table|nil  { onSliderChange=fn, onSelected=fn }
-function Menu:Slider(label, value, max, description, style, actions)
-    return self:SliderProgress(label, value, max, description, style, true, actions)
+---@param enabled      boolean|nil
+---@param actions      table|nil  { step=number, onChange=fn, onSelect=fn }
+function Menu:Slider(label, value, max, description, enabled, actions)
+    return self:SliderProgress(label, value, max, description, enabled, actions)
 end
 
-
---TODO MODIFIER CETTE ITEM DE PROGRESS RETIRER Fléches gauche / droite et avoir un vrai progress pour la stamina health ped native fivem
--- progress 
--- Note
----@param text string
+---@param text          string
 ---@param progressStart number
----@param progressMax number
----@param description string
----@param style table (optionnel, pour config spécifique ce progress)
----@param enabled boolean (optionnel, dÃ©faut true)
----@param actions table (optionnel, pour override les actions par défaut de ce progress)
--- myMenu:Progress("label", 10, 100, "desc", style, enabled, actions)
-function Menu:Progress(text, progressStart, progressMax, description, style, enabled, actions)
-    return self:AddItem(UIMenuProgressItem.New(text, progressStart, progressMax, description, style, enabled, actions))
+---@param progressMax   number
+---@param description   string|nil
+---@param enabled       boolean|nil
+---@param actions       table|nil
+function Menu:Progress(text, progressStart, progressMax, description, enabled, actions)
+    return self:AddItem(UIMenuProgressItem.New(text, progressStart, progressMax, description, enabled, actions))
 end
 
--- heritage cretor menu
--- Note: ce type d'item est similaire au slider de progression, mais il est spécifiquement conçu pour les menus de création de personnage (heritage). Il peut inclure des fonctionnalités supplémentaires comme la sélection de parents, la génération aléatoire, etc. Les paramètres sont similaires à ceux du slider de progression, mais le style et les actions peuvent être adaptés pour ce contexte spécifique.
--- Exemple d'utilisation: myMenu:Heritage("Face Shape", 0, 100, 50, 1, "Adjust the face shape", style, true, { onChange = function(menu, item, newValue) print("New face shape value: " .. newValue) end })
--- Note: pour les items de type heritage, on peut aussi gérer des sous-options spécifiques à la création de personnage, comme la sélection de parents (father/mother), la génération aléatoire, etc. Dans ce cas, le style peut inclure des configurations pour ces fonctionnalités, et les actions peuvent inclure des callbacks spécifiques pour gérer ces interactions. Cependant, dans la version actuelle, on suppose que l'item Heritage est un simple slider avec des paramètres similaires au slider de progression.
---- @param text string
---- @param min number
---- @param max number
---- @param value number
---- @param step number
---- @param description string
---- @param style table (optionnel, pour config spÃ©cifique Ã  ce heritage)
---- @param enabled boolean (optionnel, dÃ©faut true)
---- @param actions table (optionnel, pour override les actions par dÃ©faut de ce heritage)
--- myMenu:Heritage("label", 0, 100, 50, 1, "desc", style, enabled, actions)
---- menu:Heritage("label", 0, 100, 50, 1, "desc", { onSliderChange=fn })
 ---@param label       string
 ---@param min         number
 ---@param max         number
 ---@param value       number
----@param step        number
 ---@param description string|nil
----@param actions     table|nil  { onSliderChange=fn, onSelected=fn }
-function Menu:Heritage(label, min, max, value, step, description, actions)
-    return self:AddItem(UIMenuSliderHeritageItem.New(label, min, max, value, step, description, nil, true, NormalizeActions(actions)))
+---@param enabled     boolean|nil
+---@param actions     table|nil  { step=number, onChange=fn, onSelect=fn }
+function Menu:Heritage(label, min, max, value, description, enabled, actions)
+    return self:AddItem(UIMenuSliderHeritageItem.New(label, min, max, value, description, enabled, NormalizeActions(actions)))
 end
 
 --- Panneau portrait héritage (mère/père) — non navigable, hauteur propre
@@ -365,6 +388,11 @@ function Menu:Open()
     self._justOpened = true
     self._dirty = true
 
+    -- Démarrer le chargement du scaleform glare dès l'ouverture (non-bloquant)
+    if Config.Header.glare and Config.Header.glare.enabled then
+        Glare.Init()
+    end
+
     -- Si currentItem pointe sur un item non-navigable (window/separator), corriger
     local cur = self.items[self.currentItem]
     if cur and (cur.isSeparator or cur.type == "window") then
@@ -376,11 +404,15 @@ function Menu:Open()
 end
 
 -- Fermer le menu
--- Note : cette fonction rend le menu invisible en mettant self.visible à false, réinitialise l'index actuel à 1, et émet l'événement OnMenuClosed pour notifier les listeners que le menu a été fermé. Elle peut aussi être utilisée pour appliquer des effets de fermeture ou nettoyer certains états lors de la fermeture du menu.
--- Example : myMenu:Close() pour fermer le menu. Si le menu est déjà fermé, cette fonction n'a pas d'effet.
 function Menu:Close()
+    if not self.visible then return end  -- guard anti-double-close
     self.visible = false
     self.currentItem = self:_FirstNavigableIndex()
+
+    -- Libère le scaleform glare si activé (économise le handle GPU)
+    if self._glareEnabled then
+        Glare.Cleanup()
+    end
 
     MenuPool.NotifyMenuClosed(self)
     self.OnMenuClosed.Emit(self)
@@ -420,6 +452,7 @@ function Menu:SetCurrentIndex(index)
         self._dirty = true
         self.OnIndexChange.Emit(self, index)
         self:_UpdateCounter()
+        self:_UpdateVisibleRange()
     end
 end
 
@@ -428,7 +461,7 @@ end
 function Menu:_FirstNavigableIndex()
     for i = 1, #self.items do
         local item = self.items[i]
-        if item and not item.isSeparator and item.type ~= "window" then
+        if item and not item.isSeparator and item.type ~= "window" and item.type ~= "panel" then
             return i
         end
     end
@@ -450,7 +483,7 @@ function Menu:GoUp()
     local attempts = 0
     while attempts < #self.items do
         local item = self.items[newIndex]
-        if not item or (not item.isSeparator and item.type ~= "window") then break end
+        if not item or (not item.isSeparator and item.type ~= "window" and item.type ~= "panel") then break end
         newIndex = newIndex - 1
         if newIndex < 1 then newIndex = #self.items end
         attempts = attempts + 1
@@ -474,7 +507,7 @@ function Menu:GoDown()
     local attempts = 0
     while attempts < #self.items do
         local item = self.items[newIndex]
-        if not item or (not item.isSeparator and item.type ~= "window") then break end
+        if not item or (not item.isSeparator and item.type ~= "window" and item.type ~= "panel") then break end
         newIndex = newIndex + 1
         if newIndex > #self.items then newIndex = 1 end
         attempts = attempts + 1
@@ -521,12 +554,48 @@ function Menu:Process()
     if not self.visible then return end
 end
 
+--- Cache les indices visibles et la hauteur totale — appelé depuis SetCurrentIndex() et _Recalculate().
+function Menu:_UpdateVisibleRange()
+    local itemHeight = self._itemHeight or 35
+    local items = self.items
+    local n = #items
+
+    -- Compter les items window en tête (non scrollables, toujours visibles)
+    local winCount = 0
+    for i = 1, n do
+        if items[i] and items[i].type == "window" then winCount = winCount + 1 else break end
+    end
+    self._winCount = winCount
+
+    local half = math.floor(self.maxItemsOnScreen * 0.5)
+    local s = math.max(1, self.currentItem - half)
+    local e = math.min(n, s + self.maxItemsOnScreen - 1)
+    if e - s < self.maxItemsOnScreen - 1 then
+        s = math.max(1, e - self.maxItemsOnScreen + 1)
+    end
+    local h = 0
+    for i = s, e do
+        local it = items[i]
+        h = h + ((it and it.GetHeight and it:GetHeight()) or itemHeight)
+    end
+    -- Si les windows sont au-dessus de la plage scrollable, leur hauteur s'ajoute au fond
+    if winCount > 0 and s > winCount then
+        for i = 1, winCount do
+            local it = items[i]
+            h = h + ((it and it.GetHeight and it:GetHeight()) or itemHeight)
+        end
+    end
+    self._visibleStart       = s
+    self._visibleEnd         = e
+    self._visibleTotalHeight = h
+end
+
 --- Cache le counter text — appelé depuis SetCurrentIndex() et _Recalculate(), jamais depuis Draw()
 function Menu:_UpdateCounter()
     local navPos, navTotal = 0, 0
     for i = 1, #self.items do
         local it = self.items[i]
-        if it and not it.isSeparator and it.type ~= "window" then
+        if it and not it.isSeparator and it.type ~= "window" and it.type ~= "panel" then
             navTotal = navTotal + 1
             if i <= self.currentItem then navPos = navTotal end
         end
@@ -538,377 +607,630 @@ end
 function Menu:_Recalculate()
     if not self._needsRecalculate then return end
 
-    local itemHeight = (Config.Layout and Config.Layout.itemHeight) or 35
-    local yOffset = self.y + Config.Header.size.height + Config.Subtitle.size.height
+    local menuW = Config.Header.size.width
+    self._menuWidth = menuW
+    self._headerHeight = Config.Header.size.height
+    self._subtitleHeight = Config.Subtitle.size.height
+    self._itemHeight = (Config.Layout and Config.Layout.itemHeight) or 35
 
+    -- 1. CACHE HEADER
+    local hCfg = Config.Header
+    self._hSpriteUse = hCfg.sprite and hCfg.sprite.use
+    self._hSpriteDict = hCfg.sprite and hCfg.sprite.dict or "commonmenu"
+    self._hSpriteName = hCfg.sprite and hCfg.sprite.name or "interaction_bgd"
+    local hTint = hCfg.sprite and (hCfg.sprite.color or hCfg.sprite.tint) or {r=255,g=255,b=255,a=255}
+    self._hSpriteR, self._hSpriteG, self._hSpriteB, self._hSpriteA = hTint.r, hTint.g, hTint.b, hCfg.sprite and hCfg.sprite.alpha or hTint.a
+    
+    local tc = hCfg.title or {}
+    self._tFont, self._tScale, self._tAlign = tc.font or 1, tc.size or 0.95, tc.alignment or 1
+    self._tColor = tc.color or {r=255,g=255,b=255,a=255}
+    self._tShadow = tc.shadow and tc.shadow.enabled and tc.shadow or nil
+    self._titleX = (self._tAlign == 1) and (self.x + menuW * 0.5) or (tc.offsetX and self.x + tc.offsetX or self.x)
+    -- offsetY scale proportionnellement avec headerHeight via tc.refHeight (calibration)
+    local _tRefH = tc.refHeight or self._headerHeight
+    self._titleY = self.y + (tc.offsetY or 0) * (self._headerHeight / _tRefH)
+
+    -- 2. CACHE SUBTITLE
+    local sCfg = Config.Subtitle
+    self._subBg = sCfg.background or {r=0,g=0,b=0,a=255}
+    
+    local st = sCfg.text or {}
+    self._stFont, self._stScale = st.font or 0, st.size or 0.28
+    self._stColor = st.color or {r=245,g=245,b=245,a=255}
+    self._subtitleX = self.x + (st.offsetX or 0)
+    self._subtitleY = self.y + self._headerHeight + (st.offsetY or 0)
+
+    local sc = sCfg.counter or {}
+    self._scFont, self._scScale = sc.font or 0, sc.size or 0.28
+    self._scColor = sc.color or {r=245,g=245,b=245,a=255}
+    self._counterX = self.x + (sc.offsetX or (menuW - ((sCfg.padding and sCfg.padding.right) or 8)))
+    self._counterY = self.y + self._headerHeight + (sc.offsetY or 0)
+
+    -- 2b. PRE-NORMALISATION header + subtitle (élimine toutes les mul/div dans Draw* par frame)
+    -- Les coordonnées normalisées (0..1) sont stables tant que la résolution et la position
+    -- du menu ne changent pas. Draw.GetInvScale() initialise cachedInvW/H si nécessaire.
+    -- Appel direct (pas via upvalue) : _fnGetInvScale est nil à la déclaration et le linter
+    -- ne peut pas prouver statiquement qu'_InitUpvalues l'a rempli avant cette ligne.
+    local invW, invH = Draw.GetInvScale()
+
+    -- Header sprite : centre normalisé + taille normalisée
+    local hNW = menuW * invW
+    local hNH = self._headerHeight * invH
+    self._hSpriteNX = self.x * invW + hNW * 0.5
+    self._hSpriteNY = self.y * invH + hNH * 0.5
+    self._hSpriteNW = hNW
+    self._hSpriteNH = hNH
+
+    -- Titre header : position normalisée
+    self._titleNX = self._titleX * invW
+    self._titleNY = self._titleY * invH
+
+    -- Shadow : valeurs aplaties (évite shadow.color.r/g/b/a par frame dans Text.Draw)
+    if self._tShadow then
+        local shColor = self._tShadow.color or {}
+        self._tShadowDist = self._tShadow.distance or 2
+        self._tShadowR = shColor.r or 0
+        self._tShadowG = shColor.g or 0
+        self._tShadowB = shColor.b or 0
+        self._tShadowA = shColor.a or 150
+    end
+
+    -- Subtitle rect : centre normalisé + taille normalisée
+    local stNW = menuW * invW
+    local stNH = self._subtitleHeight * invH
+    local stRawY = self.y + self._headerHeight
+    self._subRectNX = self.x * invW + stNW * 0.5
+    self._subRectNY = stRawY * invH + stNH * 0.5
+    self._subRectNW = stNW
+    self._subRectNH = stNH
+
+    -- Couleurs subtitle rect aplaties (évite "color and color.r or 255" par frame)
+    local bg = self._subBg
+    self._subBgR, self._subBgG, self._subBgB, self._subBgA = bg.r, bg.g, bg.b, bg.a
+
+    -- Subtitle texte : position normalisée
+    self._subtitleNX = self._subtitleX * invW
+    self._subtitleNY = self._subtitleY * invH
+
+    -- Counter texte : position normalisée + nxWrap pré-calculé pour SetTextWrap (align=2)
+    self._counterNX   = self._counterX * invW
+    self._counterNY   = self._counterY * invH
+    -- Pour alignment==2, Text.DrawRaw passe nxWrap à SetTextWrap(0.0, nxWrap)
+    -- c'est la même valeur que _counterNX
+    self._counterNXWrap = self._counterNX
+
+    -- 2c. GLARE (scaleform header) — flag + dimensions pré-calculées
+    self._glareEnabled = Config.Header.glare and Config.Header.glare.enabled == true
+    if self._glareEnabled then
+        local gCfg = Config.Header.glare
+        self._glareW = menuW              * (gCfg.widthScale  or 1.0)
+        self._glareH = self._headerHeight * (gCfg.heightScale or 1.0)
+        -- Auto-centrage sur le header : le scaleform (potentiellement large) est toujours
+        -- centré sur la zone header. offsetX/Y = fine-tuning en pixels (0 = centré).
+        self._glareX = self.x - (self._glareW - menuW) * 0.5 + (gCfg.offsetX or 0)
+        self._glareY = self.y - (self._glareH - self._headerHeight) * 0.5 + (gCfg.offsetY or 0)
+    end
+
+    -- 3. CACHE ITEMS BACKGROUND
+    local ibCfg = Config.ItemsBackground or {}
+    self._ibSpriteUse = ibCfg.sprite and ibCfg.sprite.use
+    self._ibSpriteDict = ibCfg.sprite and ibCfg.sprite.dict or "commonmenu"
+    self._ibSpriteName = ibCfg.sprite and ibCfg.sprite.name or "gradient_bgd"
+    local ibTint = ibCfg.sprite and (ibCfg.sprite.color or ibCfg.sprite.tint) or {r=255,g=255,b=255,a=255}
+    self._ibSpriteR, self._ibSpriteG, self._ibSpriteB, self._ibSpriteA = ibTint.r, ibTint.g, ibTint.b, ibCfg.sprite and ibCfg.sprite.alpha or ibTint.a
+    self._ibSpriteHeading = ibCfg.sprite and ibCfg.sprite.heading or 0.0
+    local ibCol = ibCfg.color or {r=0,g=0,b=0,a=120}
+    self._ibColorR, self._ibColorG, self._ibColorB, self._ibColorA = ibCol.r or 0, ibCol.g or 0, ibCol.b or 0, ibCol.a or 120
+    -- NX/NW stables (centre normalisé) ; NY/NH dynamiques car _visibleTotalHeight change
+    local ibNW = menuW * invW
+    self._ibSpriteNX = self.x * invW + ibNW * 0.5
+    self._ibSpriteNW = ibNW
+
+    -- 4. CACHE NAVIGATION HIGHLIGHT
+    local navCfg = Config.Navigation or {}
+    self._navH = navCfg.size and navCfg.size.height or self._itemHeight
+    self._navOffsetY = navCfg.offsetY or 0
+
+    -- Pré-normalisation nav : NX et NW stables tant que x/menuW ne changent pas
+    local navNW = menuW * invW
+    self._navNX = self.x * invW + navNW * 0.5
+    self._navNW = navNW
+
+    -- 4b. CACHE NEW STYLE (grey rows + arrow)
+    local _ns = Config.NewStyle or {}
+    self._newStyleEnabled = (_ns.enabled == true)
+
+    if self._newStyleEnabled then
+        local irCfg  = _ns.itemRow or {}
+        local irCol  = irCfg.color or {r=36,g=36,b=36,a=255}
+        local irOffX = irCfg.offsetX or 15
+        self._itemRowR    = irCol.r or 36
+        self._itemRowG    = irCol.g or 36
+        self._itemRowB    = irCol.b or 36
+        self._itemRowA    = irCol.a or 255
+        self._itemRowGapH = (irCfg.gapPx or 3) * invH
+        local irNW        = (menuW - irOffX * 2) * invW
+        self._itemRowNX   = (self.x + irOffX) * invW + irNW * 0.5
+        self._itemRowNW   = irNW
+
+        local arCfg   = _ns.arrow or {}
+        local arCol   = arCfg.color or {r=241,g=101,b=34,a=255}
+        self._arDict  = arCfg.dict   or "icon"
+        self._arName  = arCfg.name   or "arrow_right_36dp"
+        self._arNW    = (arCfg.width  or 50) * invW
+        self._arNH    = (arCfg.height or 30) * invH
+        self._arNX    = (self.x + (arCfg.offsetX or 1)) * invW + self._arNW * 0.5
+        self._arNYOff = (arCfg.offsetY or 2) * invH + self._arNH * 0.5
+        self._arR     = arCol.r or 241
+        self._arG     = arCol.g or 101
+        self._arB     = arCol.b or 34
+        self._arA     = arCol.a or 255
+
+        -- Cache label NewStyle (override position label gauche de tous les items)
+        local lbCfg = _ns.label or {}
+        self._nsLabelNX    = (self.x + (lbCfg.offsetX or 30)) * invW
+        self._nsLabelNYOff = (lbCfg.offsetY or 5) * invH
+        local nsSel = _ns.selectedColor or {}
+        self._nsSelColR = nsSel.r or 0
+        self._nsSelColG = nsSel.g or 255
+        self._nsSelColB = nsSel.b or 255
+        self._nsSelColA = nsSel.a or 255
+    end
+
+    -- 5. CACHE ITEMS (La plus grosse optimisation CPU)
+    local yOffset = self.y + self._headerHeight + self._subtitleHeight
     for i, item in ipairs(self.items) do
         self._cachedPositions[i] = { x = self.x, y = yOffset }
         -- Les items window ont une hauteur propre (GetHeight), les autres utilisent itemHeight
-        local h = (item.GetHeight and item:GetHeight()) or itemHeight
+        local h = (item.GetHeight and item:GetHeight()) or self._itemHeight
+        item._h = h
         yOffset = yOffset + h
+
+        if item.type ~= "window" and item.type ~= "panel" then
+            local typeCfg = self._itemTypeCfg[item.type] or Config.Button
+            local labelCfg = (typeCfg and typeCfg.label) or (Config.Button and Config.Button.label) or {}
+            
+            item._bgCfg = (typeCfg and typeCfg.background) or (Config.Button and Config.Button.background) or {}
+            item._font = labelCfg.font or 0
+            item._scale = labelCfg.size or 0.26
+            item._textX = self.x + (labelCfg.offsetX or 0)
+            item._textYOffset = labelCfg.offsetY or 0
+
+            -- Cache des couleurs pour éviter les lookups
+            item._defCol = labelCfg.color and labelCfg.color.default or {r=255,g=255,b=255,a=255}
+            item._selCol = labelCfg.color and labelCfg.color.selected or {r=0,g=0,b=0,a=255}
+            item._disCol = labelCfg.color and labelCfg.color.disabled or {r=163,g=159,b=148,a=255}
+
+            -- Calcul de la largeur max pour l'ellipsize (FAIT 1 SEULE FOIS)
+            local maxLabelWidth = nil
+            if item.type == "list" then
+                local lCfg = Config.List or {}
+                local uiCfg = lCfg.ui or {}
+                local valueCfg = lCfg.value or {}
+                local left, right = uiCfg.left or "←", uiCfg.right or "→"
+                local baselineW = math.floor(menuW * 0.33)
+                local arrowsW = Text.GetWidth(left .. "  " .. right, valueCfg.font or 0, valueCfg.size or 0.26)
+                
+                item._listRawMaxWidthWithArrows = math.max(0, baselineW - arrowsW)
+                item._listRawMaxWidthNoArrows = baselineW
+                item._listMaxLabelWidth = math.max(0, (self.x + menuW - (valueCfg.offsetRightX or valueCfg.offsetX or 0)) - item._textX - ((lCfg.labelValueGap ~= nil) and lCfg.labelValueGap or 10) - baselineW)
+                maxLabelWidth = item._listMaxLabelWidth
+                -- Pré-normalise X du texte valeur droite (élimine 1 mul/div par frame dans DrawCustom list)
+                item._listValueRightNX = (self.x + menuW - (valueCfg.offsetRightX or valueCfg.offsetX or 0)) * invW
+
+            elseif item.type == "checkbox" and Config.Checkbox and Config.Checkbox.sprite then
+                maxLabelWidth = (self.x + menuW - (Config.Checkbox.sprite.offsetRightX or 12) - (Config.Checkbox.sprite.size or 32)) - item._textX - ((Config.Checkbox.labelSpriteGap ~= nil) and Config.Checkbox.labelSpriteGap or 10)
+
+            elseif item.type == "sliderprogress" and Config.SliderProgress and Config.SliderProgress.bar then
+                maxLabelWidth = (self.x + menuW - (Config.SliderProgress.bar.offsetRightX or 12) - (Config.SliderProgress.bar.width or 120)) - item._textX - ((Config.SliderProgress.labelBarGap ~= nil) and Config.SliderProgress.labelBarGap or 10)
+
+            elseif item.type == "heritage" then
+                local hCfg = Config.Heritage or {}
+                local style = item.style or {}
+                local groupW = (math.max(0, tonumber(style.iconSize) or tonumber((hCfg.icons or {}).size) or 40) * 2) + (math.max(0, tonumber(style.gap) or tonumber((hCfg.icons or {}).gap) or 6) * 2) + math.max(0, tonumber(style.barWidth) or tonumber((hCfg.bar or {}).width) or 120)
+                maxLabelWidth = (self.x + menuW - (tonumber(style.offsetRightX) or tonumber(hCfg.offsetRightX) or 12) - groupW) - item._textX - ((hCfg.labelBarGap ~= nil) and hCfg.labelBarGap or 10)
+
+            elseif item.type == "progress" and Config.Progress and Config.Progress.bar then
+                maxLabelWidth = (self.x + menuW - (Config.Progress.bar.offsetRightX or 12) - (Config.Progress.bar.width or 120)) - item._textX - ((Config.Progress.labelBarGap ~= nil) and Config.Progress.labelBarGap or 10)
+            end
+
+            -- Badge button (RightBadge / LeftBadge / RightLabel)
+            if item.type == "button" then
+                local bdgCfg  = (Config.Button and Config.Button.badge) or {}
+                local bdgSize = bdgCfg.size or 28
+                local bdgOffY = bdgCfg.offsetY
+                -- Centre Y du badge dans l'item (centré automatiquement si offsetY nil)
+                local bdgNYOff = bdgOffY
+                    and (bdgOffY + bdgSize * 0.5) * invH
+                    or  ((self._itemHeight - bdgSize) * 0.5 + bdgSize * 0.5) * invH
+                item._badgeNW    = bdgSize * invW
+                item._badgeNH    = bdgSize * invH
+                item._badgeNYOff = bdgNYOff
+
+                if item.rightBadge then
+                    local offR = bdgCfg.offsetRightX or 6
+                    item._badgeRightNX = (self.x + menuW - offR - bdgSize * 0.5) * invW
+                    -- Réduire maxLabelWidth pour ne pas chevaucher le badge
+                    maxLabelWidth = math.min(
+                        maxLabelWidth or (menuW - (item._textX - self.x) - (labelCfg.rightPadding or 20)),
+                        (self.x + menuW - offR - bdgSize) - item._textX - 6
+                    )
+                end
+                if item.leftBadge then
+                    local offL = bdgCfg.offsetLeftX or 6
+                    item._badgeLeftNX = (self.x + offL + bdgSize * 0.5) * invW
+                    -- Décaler le texte à droite du badge (offL + badge + 6px de gap)
+                    item._textX = self.x + offL + bdgSize + 6
+                end
+                if item.rightLabel then
+                    local lCfg = (Config.Button and Config.Button.label) or {}
+                    item._rlNX = (self.x + menuW - (lCfg.rightPadding or 20)) * invW
+                end
+            end
+
+            if not maxLabelWidth then
+                maxLabelWidth = menuW - (item._textX - self.x) - (labelCfg.rightPadding or 20)
+            end
+
+            -- Ellipsize pré-calculé !
+            item._ellipsizedText = Text.Ellipsize(item.text or "Item", maxLabelWidth, item._font, item._scale)
+
+            -- Pré-normalisation label (élimine 2 divisions par item par frame dans _DrawItems)
+            item._textNX    = item._textX * invW
+            item._textNYOff = item._textYOffset * invH
+
+            -- NewStyle : override position label gauche
+            if self._newStyleEnabled then
+                item._textNX    = self._nsLabelNX
+                item._textNYOff = self._nsLabelNYOff
+            end
+
+            -- Pré-aplatir couleur sélectionnée background (élimine accès table dans _DrawNavigationHighlight)
+            local selBg = item._bgCfg and item._bgCfg.selected
+            if selBg then
+                item._selBgR = selBg.r or 255
+                item._selBgG = selBg.g or 255
+                item._selBgB = selBg.b or 255
+                item._selBgA = selBg.a or 255
+            else
+                item._selBgR, item._selBgG, item._selBgB, item._selBgA = 255, 255, 255, 255
+            end
+        end
     end
 
-    -- Cache positions statiques header + subtitle (jamais recomputees en Draw)
-    local hCfg  = Config.Header
-    local sCfg  = Config.Subtitle
-    local menuW = hCfg.size.width
-    local yPos  = self.y + hCfg.size.height
-
-    local titleCfg = hCfg.title
-    self._titleX = (titleCfg and titleCfg.alignment == 1)
-        and (self.x + menuW * 0.5)
-        or  (titleCfg and titleCfg.offsetX ~= nil and self.x + titleCfg.offsetX or self.x)
-    self._titleY = self.y + (titleCfg and titleCfg.offsetY or 0)
-
-    local tCfg = sCfg.text
-    self._subtitleX = self.x + (tCfg and tCfg.offsetX or 0)
-    self._subtitleY = yPos   + (tCfg and tCfg.offsetY or 0)
-
-    local cCfg = sCfg.counter
-    local padR = (cCfg and cCfg.offsetX ~= nil) and cCfg.offsetX
-        or (menuW - ((sCfg.padding and sCfg.padding.right) or 8))
-    self._counterX = self.x + padR
-    self._counterY = yPos + (cCfg and cCfg.offsetY or 0)
+    -- 6. CACHE DESCRIPTION (élimine ~15 lookups Config + GetTextScaleHeight par frame)
+    local dCfg  = Config.Description or {}
+    local dPad  = dCfg.padding or {}
+    local dText = dCfg.text or {}
+    local dPadLeft   = dPad.left   or dText.offsetX or 0
+    local dPadRight  = dPad.right  or dPadLeft
+    local dPadTop    = dPad.top    or dText.offsetY or 0
+    local dPadBottom = dPad.bottom or dPadTop
+    self._descSpacing    = dCfg.spacing or 0
+    self._descPadTop     = dPadTop
+    self._descPadBottom  = dPadBottom
+    self._descTextX      = self.x + (dText.offsetX or dPadLeft)
+    self._descTextYOff   = dText.offsetY or dPadTop
+    self._descWrapWidth  = dText.maxWidth or (menuW - dPadLeft - dPadRight)
+    self._descFont       = tonumber(dText.font) or 0
+    self._descSize       = tonumber(dText.size) or 0.35
+    self._descBackground = dCfg.background
+    self._descTextColor  = dText.color
+    local dCfgLineH = dText.lineHeight or 19
+    -- Native line height : appelée 1x ici, jamais dans _DrawDescription
+    local dNativeLineH = 0
+    local dRes = Draw.GetResolution()
+    local dResH = dRes and dRes.height or 1080
+    if type(GetTextScaleHeight) == "function" then
+        dNativeLineH = GetTextScaleHeight(self._descSize, self._descFont) * dResH
+    elseif type(GetRenderedCharacterHeight) == "function" then
+        dNativeLineH = GetRenderedCharacterHeight(self._descSize, self._descFont) * dResH
+    end
+    self._descLineHeight = math.max(dCfgLineH, math.ceil(dNativeLineH) + 2)
+    -- Clé de mesure pré-construite (élimine table.concat à chaque frame)
+    self._descMeasureParamsKey = table.concat({
+        tostring(self._descFont), tostring(self._descSize),
+        tostring(self._descWrapWidth), tostring(self._descLineHeight),
+        tostring(dPadTop), tostring(dPadBottom)
+    }, "|")
+    if not self._descCacheSize then self._descCacheSize = {} end
 
     self:_UpdateCounter()
-
+    self:_UpdateVisibleRange()
     self._needsRecalculate = false
 end
 
 -- Dessiner le menu
 function Menu:Draw()
-    if not self.visible then return end
-    
+    --[[if not self.visible then return end
+
     if self._dirty or self._needsRecalculate then
         self:_Recalculate()
         self._dirty = false
     end
-    
+
     self:_DrawHeader()
     self:_DrawSubtitle()
     self:_DrawItemsBackground()
-    self:_DrawItems()
-    
+    self:_DrawItems()]]
+
+        if not self.visible then return end
+
+    if self._dirty or self._needsRecalculate then
+        self:_Recalculate()
+        self._dirty = false
+    end
+
+    -- ✅ Un seul appel pour toutes les sous-fonctions
+    local invW, invH = Draw.GetInvScale()
+
+    self:_DrawHeader()
+    self:_DrawSubtitle()
+    self:_DrawItemsBackground(invH)   -- reçoit invH, ne rappelle pas GetInvScale
+    self:_DrawItems(invW, invH)   
+
+    -- Y de départ pour les panels (sous les items)
+    local panelStartY = self.y + self._headerHeight + self._subtitleHeight + self._visibleTotalHeight
+
     local currentItem = self:GetCurrentItem()
-    if currentItem and currentItem.description and currentItem.description ~= "" then
-        self:_DrawDescription(currentItem.description)
+    local desc = currentItem and (
+        (currentItem._descFn and currentItem._descFn(currentItem))
+        or currentItem.description
+    ) or nil
+    if desc and desc ~= "" then
+        panelStartY = self:_DrawDescription(desc)
+    end
+
+    -- Panels style RageUI : appelle la closure stockée par menu:SetPanels(fn)
+    if self._panelsFn then
+        _AmaUIPanelMenu      = self
+        _AmaUIPanelX         = self.x
+        _AmaUIPanelY         = panelStartY
+        _AmaUIPanelStatCount = 0
+        self._panelsFn()
+        -- ⚡ Flush le buffer de statistiques (1 DrawRect fond pour N stats empilées)
+        if _AmaUIPanelFlush then _AmaUIPanelFlush() end
+        _AmaUIPanelMenu = nil
     end
 end
 
 -- Dessiner le header
+-- Toutes les coordonnées sont pré-normalisées dans _Recalculate : zéro mul/div/accès-table ici.
 function Menu:_DrawHeader()
-    local cfg = Config.Header
-    if cfg.sprite and cfg.sprite.use then
-        local tint = cfg.sprite.color or cfg.sprite.tint
-        Draw.Sprite(cfg.sprite.dict, cfg.sprite.name,
-            self.x, self.y, cfg.size.width, cfg.size.height,
-            cfg.sprite.heading or 0.0,
-            tint and tint.r or 255,
-            tint and tint.g or 255,
-            tint and tint.b or 255,
-            cfg.sprite.alpha or (tint and tint.a or 255))
+    if self._hSpriteUse then
+        -- SpriteRaw : coordonnées déjà normalisées, EnsureTexture + DrawSprite direct.
+        _fnSpriteRaw(self._hSpriteDict, self._hSpriteName,
+            self._hSpriteNX, self._hSpriteNY, self._hSpriteNW, self._hSpriteNH,
+            0.0, self._hSpriteR, self._hSpriteG, self._hSpriteB, self._hSpriteA)
     end
-    local tc = cfg.title
-    Text.Draw(self.title, self._titleX, self._titleY,
-        tc.font, tc.size, tc.color, tc.alignment,
-        tc.shadow and tc.shadow.enabled and tc.shadow or nil)
+    -- Glare : superposé sur le sprite, derrière le titre (dimensions depuis _Recalculate)
+    if self._glareEnabled then
+        Glare.Draw(self._glareX, self._glareY, self._glareW, self._glareH)
+    end
+    if self._tShadow then
+        -- DrawRawShadow : positions normalisées + valeurs shadow aplaties, SetTextProportional inclus.
+        _fnDrawRawShadow(self.title,
+            self._titleNX, self._titleNY,
+            self._tFont, self._tScale,
+            self._tColor.r, self._tColor.g, self._tColor.b, self._tColor.a,
+            self._tAlign,
+            self._tShadowDist, self._tShadowR, self._tShadowG, self._tShadowB, self._tShadowA)
+    else
+        -- DrawRaw : positions normalisées + reset alignement état GTA.
+        _fnDrawRaw(self.title,
+            self._titleNX, self._titleNY,
+            self._tFont, self._tScale,
+            self._tColor.r, self._tColor.g, self._tColor.b, self._tColor.a,
+            self._tAlign)
+    end
 end
 
 -- Dessiner le subtitle
+-- Toutes les coordonnées sont pré-normalisées dans _Recalculate : zéro mul/div/accès-table ici.
 function Menu:_DrawSubtitle()
-    local cfg  = Config.Subtitle
-    local hCfg = Config.Header
-    Draw.Rect(self.x, self.y + hCfg.size.height, hCfg.size.width, cfg.size.height, cfg.background)
-    local tc = cfg.text
-    Text.Draw(self.subtitle, self._subtitleX, self._subtitleY,
-        tc.font, tc.size, tc.color, Text.Align.Left)
+    -- RectRaw : centre normalisé + taille normalisée + composantes couleur aplaties.
+    _fnRectRaw(self._subRectNX, self._subRectNY, self._subRectNW, self._subRectNH,
+        self._subBgR, self._subBgG, self._subBgB, self._subBgA)
+
+    -- Subtitle texte : alignment==0, pas de SetTextCentre/RightJustify dans DrawRaw.
+    _fnDrawRaw(self.subtitle,
+        self._subtitleNX, self._subtitleNY,
+        self._stFont, self._stScale,
+        self._stColor.r, self._stColor.g, self._stColor.b, self._stColor.a,
+        0)
+
     if self._counterText then
-        local cc = cfg.counter
-        Text.Draw(self._counterText, self._counterX, self._counterY,
-            cc.font, cc.size, cc.color, Text.Align.Right)
+        -- Counter : alignment==2 (droite), nxWrap pré-calculé = _counterNX.
+        _fnDrawRaw(self._counterText,
+            self._counterNX, self._counterNY,
+            self._scFont, self._scScale,
+            self._scColor.r, self._scColor.g, self._scColor.b, self._scColor.a,
+            2, self._counterNXWrap)
     end
 end
 
---- Obtenir la config spÃ©cifique Ã  un type d'item (list, checkbox, sliderprogress, heritage, progress)
---- Si la config spÃ©cifique n'existe pas, fallback sur Button (pour Ã©viter d'avoir Ã  gÃ©rer nil partout)
----@param itemType string
-local function GetItemTypeConfig(itemType)
-    if itemType == "list" then
-        return Config.List
-    end
-    if itemType == "checkbox" then
-        return Config.Checkbox or Config.Button
-    end
-    if itemType == "sliderprogress" then
-        return Config.SliderProgress or Config.Button
-    end
-    if itemType == "heritage" then
-        return Config.Heritage or Config.SliderProgress or Config.Button
-    end
-    if itemType == "progress" then
-        return Config.Progress or Config.Button
-    end
-    return Config.Button
-end
 
 --- Dessiner le highlight de navigation (rectangle blanc derriÃ¨re l'item sÃ©lectionnÃ©)
----@param itemY number
----@param itemHeight number
+--- Highlight de navigation. invH/item passes depuis _DrawItems, zero mul/div en frame.
 ---@param bgCfg table (config background spÃ©cifique Ã  ce type d'item, ou fallback Button)
-function Menu:_DrawNavigationHighlight(itemY, itemHeight, bgCfg)
-    local navCfg = Config.Navigation or {}
+--[[function Menu:_DrawNavigationHighlight(itemY, itemHeight, bgCfg, invH, item)
     local typeH = bgCfg and bgCfg.height
     if typeH == 0 then typeH = nil end
 
-    local navH = typeH or (navCfg.size and navCfg.size.height) or itemHeight
-    navH = math.max(0, math.min(navH, itemHeight))
+    local navH = typeH or self._navH or itemHeight
+    if navH > itemHeight then navH = itemHeight end
+    if navH < 0 then navH = 0 end
 
     local extraOffsetY = (bgCfg and bgCfg.offsetY) or 0
-    local navY = itemY + ((itemHeight - navH) * 0.5) + (navCfg.offsetY or 0) + extraOffsetY
-    Draw.Rect(self.x, navY, Config.Header.size.width, navH, bgCfg.selected)
-end
+    local navY = itemY + (itemHeight - navH) * 0.5 + self._navOffsetY + extraOffsetY
 
--- Dessiner le fond des items (gradient_bgd)
+    -- RectRaw : coordonnees normalisees, couleurs pre-aplaties depuis _Recalculate
+    local navNH = navH * invH
+    local navNY = navY * invH + navNH * 0.5
+    _fnRectRaw(self._navNX, navNY, self._navNW, navNH,
+        item._selBgR, item._selBgG, item._selBgB, item._selBgA)
+end]]
+
+-- ✅ FIX : normalisation inline directe, variable intermédiaire supprimée
+function Menu:_DrawNavigationHighlight(itemY, itemHeight, bgCfg, invH, item)
+    local typeH = bgCfg and bgCfg.height
+    if typeH == 0 then typeH = nil end
+
+    local navH = typeH or self._navH or itemHeight
+    if navH > itemHeight then navH = itemHeight end
+    if navH < 0 then navH = 0 end
+
+    local extraOffsetY = (bgCfg and bgCfg.offsetY) or 0
+    local navY = itemY + (itemHeight - navH) * 0.5 + self._navOffsetY + extraOffsetY
+
+    -- ✅ fusion en 3 opérations au lieu de 4 (navNH réutilisé directement)
+    local navNH = navH * invH
+    _fnRectRaw(self._navNX, navY * invH + navNH * 0.5, self._navNW, navNH,
+        item._selBgR, item._selBgG, item._selBgB, item._selBgA)
+end
+-- Dessiner le fond des items (gradient_bgd) — tous les champs Config pré-cachés
 function Menu:_DrawItemsBackground()
     if #self.items == 0 then return end
 
-    local cfg = Config.ItemsBackground
-    local yStart = self.y + Config.Header.size.height + Config.Subtitle.size.height
-    local itemHeight = (Config.Layout and Config.Layout.itemHeight) or 35
+    local yStart      = self.y + self._headerHeight + self._subtitleHeight
+    local totalHeight = self._visibleTotalHeight
+    local _, invH     = Draw.GetInvScale()
+   -- local nh          = totalHeight * invH
+    local nh = totalHeight * invH
+    local ny          = yStart * invH + nh * 0.5
 
-    -- Calculer les indices visibles (même logique que _DrawItems)
-    local startIndex = math.max(1, self.currentItem - math.floor(self.maxItemsOnScreen / 2))
-    local endIndex   = math.min(#self.items, startIndex + self.maxItemsOnScreen - 1)
-    if endIndex - startIndex < self.maxItemsOnScreen - 1 then
-        startIndex = math.max(1, endIndex - self.maxItemsOnScreen + 1)
-    end
-
-    -- Sommer les hauteurs réelles (window = 155px, autres = itemHeight)
-    local totalHeight = 0
-    for i = startIndex, endIndex do
-        local item = self.items[i]
-        totalHeight = totalHeight + ((item and item.GetHeight and item:GetHeight()) or itemHeight)
-    end
-    
-    if cfg.sprite and cfg.sprite.use then
-        local tint = cfg.sprite.color or cfg.sprite.tint
-        local ok = Draw.Sprite(
-            cfg.sprite.dict,
-            cfg.sprite.name,
-            self.x,
-            yStart,
-            Config.Header.size.width,
-            totalHeight,
-            (cfg.sprite.heading ~= nil) and cfg.sprite.heading or 0.0,
-            tint and tint.r or 0,
-            tint and tint.g or 0,
-            tint and tint.b or 0,
-            (cfg.sprite.alpha ~= nil) and cfg.sprite.alpha or (tint and tint.a or 255)
+    if self._ibSpriteUse then
+        local ok = Draw.SpriteRaw(
+            self._ibSpriteDict, self._ibSpriteName,
+            self._ibSpriteNX, ny, self._ibSpriteNW, nh,
+            self._ibSpriteHeading,
+            self._ibSpriteR, self._ibSpriteG, self._ibSpriteB, self._ibSpriteA
         )
-
         if not ok then
-           Draw.Rect(self.x, yStart, Config.Header.size.width, totalHeight, cfg.color)
+            Draw.RectRaw(self._ibSpriteNX, ny, self._ibSpriteNW, nh,
+                self._ibColorR, self._ibColorG, self._ibColorB, self._ibColorA)
         end
     else
-        Draw.Rect(self.x, yStart, Config.Header.size.width, totalHeight, cfg.color)
+        Draw.RectRaw(self._ibSpriteNX, ny, self._ibSpriteNW, nh,
+            self._ibColorR, self._ibColorG, self._ibColorB, self._ibColorA)
     end
 end
 
 -- Dessiner les items
-function Menu:_DrawItems()
-    -- 
+-- invW, invH : passés depuis Draw() — zéro appel GetInvScale() redondant
+function Menu:_DrawItems(invW, invH)
     if #self.items == 0 then return end
-    -- Note: on dessine les items dans la boucle Draw pour pouvoir appliquer des effets de survol (highlight) et de texte dynamique (ellipsize en fonction du type d'item)
-    -- On pourrait optimiser en dessinant les items statiques (non sÃ©lectionnÃ©s) dans une boucle et les items dynamiques (sÃ©lectionnÃ©s) dans une autre boucle, mais pour l'instant on garde tout dans la mÃªme boucle pour la simplicitÃ©.
-    -- Calculer la plage d'items a dessiner en fonction de currentItem et maxItemsOnScreen
-    -- Exemple: maxItemsOnScreen = 10, currentItem = 1 => afficher items 1-10
-    local itemHeight = (Config.Layout and Config.Layout.itemHeight) or 35
-    local yStart = self.y + Config.Header.size.height + Config.Subtitle.size.height
-    
-    -- Calculer les items visibles
-    local startIndex = math.max(1, self.currentItem - math.floor(self.maxItemsOnScreen / 2))
-    local endIndex = math.min(#self.items, startIndex + self.maxItemsOnScreen - 1)
-    
-    -- Ajuster si on est a la fin de la liste pour toujours afficher maxItemsOnScreen
-    -- Sauf si le nombre total d'items est inferieur a maxItemsOnScreen, alors on affiche tout sans forcer le nombre
-    -- Exemple: 12 items, maxItemsOnScreen = 10, currentItem = 12 => on veut afficher les items 3-12 (10 items), pas 4-12 (9 items)
-    -- Exemple: 8 items, maxItemsOnScreen = 10, currentItem = 8 => on veut afficher les items 1-8 (tous les items), pas 1-10 (impossible)
-    -- Donc on ajuste startIndex pour compenser si endIndex est trop proche de la fin
-    -- Note: on ajuste seulement startIndex pour éviter de faire des calculs complexes sur endIndex qui est déjà limité par le nombre total d'items
-    -- Seule condition pour ajuster: si le nombre d'items affichés est inférieur à maxItemsOnScreen - 1 (car currentItem doit être inclus), alors on recule startIndex
-    -- Exemple: 12 items, maxItemsOnScreen = 10, currentItem = 12 => startIndex initial = 8, endIndex initial = 12, nombre affiché = 5 < 9 => startIndex ajusté à 3
-    --
-    if endIndex - startIndex < self.maxItemsOnScreen - 1 then
-        startIndex = math.max(1, endIndex - self.maxItemsOnScreen + 1)
+
+    local itemHeight = self._itemHeight
+    local yStart = self.y + self._headerHeight + self._subtitleHeight
+    local _itemNH     = itemHeight * invH
+
+    -- Toggle new style
+    local _newStyle = self._newStyleEnabled
+    local _irNX, _irNW, _irGapH, _irR, _irG, _irB, _irA
+    local _arDict, _arName, _arNX, _arNW, _arNH, _arNYOff, _arR, _arG, _arB, _arA
+    local _nsSelColR, _nsSelColG, _nsSelColB, _nsSelColA
+
+    if _newStyle then
+        _irNX, _irNW     = self._itemRowNX, self._itemRowNW
+        _irGapH          = self._itemRowGapH or 0
+        _irR, _irG, _irB, _irA = self._itemRowR, self._itemRowG, self._itemRowB, self._itemRowA
+        _arDict, _arName = self._arDict, self._arName
+        _arNX, _arNW, _arNH = self._arNX, self._arNW, self._arNH
+        _arNYOff         = self._arNYOff
+        _arR, _arG, _arB, _arA = self._arR, self._arG, self._arB, self._arA
+        _nsSelColR = self._nsSelColR
+        _nsSelColG = self._nsSelColG
+        _nsSelColB = self._nsSelColB
+        _nsSelColA = self._nsSelColA
     end
-    
-    -- Dessiner les items visibles (Y cumulatif pour supporter les hauteurs variables)
+
+    local startIndex = self._visibleStart
+    local endIndex   = self._visibleEnd
+    local winCount   = self._winCount or 0
+
     local runY = yStart
+    if winCount > 0 and startIndex > winCount then
+        for i = 1, winCount do
+            local item = self.items[i]
+            if item then
+                local itemH = item._h or itemHeight
+                if item.DrawCustom then item:DrawCustom(self.x, runY, false, invW, invH) end
+                runY = runY + itemH
+            end
+        end
+    end
+
     for i = startIndex, endIndex do
         local item = self.items[i]
-        local itemH = (item.GetHeight and item:GetHeight()) or itemHeight
+        local itemH = item._h or itemHeight
         local itemY = runY
         runY = runY + itemH
 
         local isSelected = (i == self.currentItem)
 
-        -- Les items window gèrent tout via DrawCustom (pas de label, pas de highlight)
-        if item.type == "window" then
-            if item.DrawCustom then item:DrawCustom(self.x, itemY) end
+        if item.type == "window" or item.type == "panel" then
+            if item.DrawCustom then item:DrawCustom(self.x, itemY, false, invW, invH) end
             goto continue
         end
 
-        local typeCfg = GetItemTypeConfig(item.type)
-        local labelCfg = (typeCfg and typeCfg.label) or (Config.Button and Config.Button.label) or {}
-        local bgCfg    = (typeCfg and typeCfg.background) or (Config.Button and Config.Button.background) or {}
-        
-        -- âš¡ SEULEMENT si sÃ©lectionnÃ© (et pas un separator), dessiner le rectangle blanc
-        if isSelected and not item.isSeparator then
-            self:_DrawNavigationHighlight(itemY, itemH, bgCfg)
-        end
-        -- âš¡ Si pas sÃ©lectionnÃ©, le gradient_bgd est dÃ©jÃ  dessinÃ© en fond
-        
-        -- Texte
-        local isEnabled = (item.enabled == nil) and true or item.enabled
-        local textColor
-        if not isEnabled then
-            textColor = labelCfg.color and labelCfg.color.disabled
-        elseif isSelected then
-            textColor = labelCfg.color and labelCfg.color.selected
-        else
-            textColor = labelCfg.color and labelCfg.color.default
-        end
-
-        local textX = self.x + (labelCfg.offsetX or 0)
-        local textY = itemY + (labelCfg.offsetY or 0)
-        local maxLabelWidth = nil
-        local labelText = item.text or "Item"
-        local labelAlreadyEllipsized = false
-
-        if item.type == "list" and Config.List and Config.List.value then
-            local menuWidth = Config.Header.size.width
-            local cfg = Config.List or {}
-            local valueCfg = cfg.value or {}
-            local uiCfg = cfg.ui or {}
-
-            local valueRightX = self.x + menuWidth - (valueCfg.offsetRightX or valueCfg.offsetX or 0)
-
-            local labelGap = (cfg.labelValueGap ~= nil) and cfg.labelValueGap or 10
-
-            -- Flexible value column width (no config change):
-            -- 1) Ensure a baseline value width (~33% menu)
-            -- 2) Ellipsize label to leave that baseline
-            -- 3) Measure the *actual drawn* label and give the value all remaining space
-            local baselineValueWidth = math.floor(menuWidth * 0.33)
-            local labelFont = labelCfg.font or 0
-            local labelSize = labelCfg.size or 0.26
-            local labelMaxForBaseline = math.max(0, valueRightX - textX - labelGap - baselineValueWidth)
-            labelText = Text.Ellipsize(labelText, labelMaxForBaseline, labelFont, labelSize)
-            labelAlreadyEllipsized = true
-
-            local drawnLabelWidth = Text.GetWidth(labelText, labelFont, labelSize)
-            local remainingAfterLabel = valueRightX - (textX + drawnLabelWidth + labelGap)
-            local valueColumnWidth = math.max(0, math.floor(math.max(baselineValueWidth, remainingAfterLabel)))
-            maxLabelWidth = math.max(0, valueRightX - textX - labelGap - valueColumnWidth)
-
-            -- Compute max raw widths for the list value, accounting for arrows.
-            -- Stable reservation for LABEL: we reserve the same column regardless of selection.
-            -- For the VALUE itself: keep two budgets so non-selected items (no arrows) can show more.
-            local font = valueCfg.font or 0
-            local size = valueCfg.size or 0.26
-            local left = uiCfg.left or ""
-            local right = uiCfg.right or ""
-            local arrowsWidth = Text.GetWidth(left .. "  " .. right, font, size)
-
-            item._listRawMaxWidthWithArrows = math.max(0, valueColumnWidth - arrowsWidth)
-            item._listRawMaxWidthNoArrows = valueColumnWidth
-            item._listValueColumnWidth = valueColumnWidth
-        elseif item.type == "checkbox" and Config.Checkbox and Config.Checkbox.sprite then
-            local menuWidth = Config.Header.size.width
-            local spriteCfg = Config.Checkbox.sprite
-            local size = spriteCfg.size or 32
-            local offsetRightX = spriteCfg.offsetRightX or 12
-            local spriteRightX = self.x + menuWidth - offsetRightX
-            local spriteLeftX = spriteRightX - size
-            local labelGap = (Config.Checkbox.labelSpriteGap ~= nil) and Config.Checkbox.labelSpriteGap or 10
-            maxLabelWidth = spriteLeftX - textX - labelGap
-
-        elseif item.type == "sliderprogress" and Config.SliderProgress and Config.SliderProgress.bar then
-            local menuWidth = Config.Header.size.width
-            local barCfg = Config.SliderProgress.bar
-            local width = barCfg.width or 120
-            local offsetRightX = barCfg.offsetRightX or 12
-            local barRightX = self.x + menuWidth - offsetRightX
-            local barLeftX = barRightX - width
-            local labelGap = (Config.SliderProgress.labelBarGap ~= nil) and Config.SliderProgress.labelBarGap or 10
-            maxLabelWidth = barLeftX - textX - labelGap
-
-        elseif item.type == "heritage" then
-            local menuWidth = Config.Header.size.width
-            local hCfg = Config.Heritage or {}
-            local iconsCfg = hCfg.icons or {}
-            local barCfg = hCfg.bar or {}
-
-            -- Mirror the layout logic inside items/heritage.lua so label never overlaps.
-            local style = item.style or {}
-            local iconSize = tonumber(style.iconSize) or tonumber(iconsCfg.size) or 40
-            local gap = tonumber(style.gap) or tonumber(iconsCfg.gap) or 6
-            local barWidth = tonumber(style.barWidth) or tonumber(barCfg.width) or 120
-            local offsetRightX = tonumber(style.offsetRightX) or tonumber(hCfg.offsetRightX) or 12
-            if iconSize < 0 then iconSize = 0 end
-            if gap < 0 then gap = 0 end
-            if barWidth < 0 then barWidth = 0 end
-
-            local groupW = (iconSize * 2) + (gap * 2) + barWidth
-            local groupRightX = self.x + menuWidth - offsetRightX
-            local groupLeftX = groupRightX - groupW
-            local labelGap = (hCfg.labelBarGap ~= nil) and hCfg.labelBarGap
-                or ((Config.SliderProgress and Config.SliderProgress.labelBarGap ~= nil) and Config.SliderProgress.labelBarGap or 10)
-            maxLabelWidth = groupLeftX - textX - labelGap
-
-        elseif item.type == "progress" and Config.Progress and Config.Progress.bar then
-            local menuWidth = Config.Header.size.width
-            local barCfg = Config.Progress.bar
-            local width = barCfg.width or 120
-            local arrowsCfg = Config.Progress.arrows
-            local reservedWidth = width
-            local offsetRightX = barCfg.offsetRightX or 12
-            if arrowsCfg and arrowsCfg.enabled ~= false then
-                local arrowSize = arrowsCfg.size or 30
-                local arrowGap = arrowsCfg.gap or 4
-                reservedWidth = reservedWidth + (arrowSize * 2) + (arrowGap * 2)
-                offsetRightX = arrowsCfg.offsetRightX or offsetRightX
-            end
-            local groupRightX = self.x + menuWidth - offsetRightX
-            local groupLeftX = groupRightX - reservedWidth
-            local labelGap = (Config.Progress.labelBarGap ~= nil) and Config.Progress.labelBarGap or 10
-            maxLabelWidth = groupLeftX - textX - labelGap
-        end
-
-        if not maxLabelWidth then
-            local rightPadding = labelCfg.rightPadding or 20
-            maxLabelWidth = Config.Header.size.width - (textX - self.x) - rightPadding
-        end
-
-        if not labelAlreadyEllipsized then
-            labelText = Text.Ellipsize(labelText, maxLabelWidth, labelCfg.font or 0, labelCfg.size or 0.26)
-        end
-
-        -- Ne pas dessiner le label par dÃ©faut pour les separators (gÃ©rÃ© dans DrawCustom)
         if not item.isSeparator then
-            Text.Draw(
-                labelText,
-                textX,
-                textY,
-                labelCfg.font or 0,
-                labelCfg.size or 0.26,
-                textColor
+            local itemNYBase = itemY * invH
+            local itemNH = (itemH == itemHeight) and _itemNH or (itemH * invH)
+
+            if _newStyle then
+                -- 1. Grey rect (inset, gap)
+                local rowNH = itemNH - _irGapH
+                _fnRectRaw(_irNX, itemNYBase + _irGapH * 0.5 + rowNH * 0.5, _irNW, rowNH,
+                    _irR, _irG, _irB, _irA)
+            else
+                -- 1. Classic white highlight
+                if isSelected then
+                    self:_DrawNavigationHighlight(itemY, itemH, item._bgCfg, invH, item)
+                end
+            end
+
+            -- 2. Label
+            local isEnabled = item.enabled ~= false
+            local tR, tG, tB, tA
+            if isSelected then
+                if _newStyle then
+                    tR, tG, tB, tA = _nsSelColR, _nsSelColG, _nsSelColB, _nsSelColA
+                else
+                    local c = item._selCol
+                    tR, tG, tB, tA = c.r, c.g, c.b, c.a
+                end
+            elseif isEnabled then
+                local c = item._defCol
+                tR, tG, tB, tA = c.r, c.g, c.b, c.a
+            else
+                local c = item._disCol
+                tR, tG, tB, tA = c.r, c.g, c.b, c.a
+            end
+            Text.DrawRaw(
+                item._ellipsizedText, item._textNX,
+                itemNYBase + item._textNYOff,
+                item._font, item._scale,
+                tR, tG, tB, tA,
+                0
             )
-        end
-        
-        -- Appeler le draw spÃ©cifique de l'item (pour checkbox, list, etc.)
-        if item.DrawCustom then
-            item:DrawCustom(self.x, itemY, isSelected)
+
+            -- 3. DrawCustom (checkbox, list, slider...)
+            if item.DrawCustom then
+                item:DrawCustom(self.x, itemY, isSelected, invW, invH)
+            end
+
+            -- 4. Arrow orange (new style, selectionne uniquement)
+            if _newStyle and isSelected then
+                _fnSpriteRaw(_arDict, _arName,
+                    _arNX, itemNYBase + _arNYOff,
+                    _arNW, _arNH, 0.0,
+                    _arR, _arG, _arB, _arA)
+            end
+        else
+            if item.DrawCustom then
+                item:DrawCustom(self.x, itemY, false, invW, invH)
+            end
         end
         ::continue::
     end
@@ -917,122 +1239,45 @@ end
 ---@param description string
 -- Dessiner la description
 function Menu:_DrawDescription(description)
-    local cfg = Config.Description
-    local spacing = cfg.spacing or 0
-    local itemHeight = (Config.Layout and Config.Layout.itemHeight) or 35
-
-    -- Même calcul d'indices que _DrawItems / _DrawItemsBackground
-    local startIndex = math.max(1, self.currentItem - math.floor(self.maxItemsOnScreen / 2))
-    local endIndex   = math.min(#self.items, startIndex + self.maxItemsOnScreen - 1)
-    if endIndex - startIndex < self.maxItemsOnScreen - 1 then
-        startIndex = math.max(1, endIndex - self.maxItemsOnScreen + 1)
-    end
-
-    -- Sommer les hauteurs réelles (window = 155px, items normaux = itemHeight)
-    local realHeight = 0
-    for i = startIndex, endIndex do
-        local item = self.items[i]
-        realHeight = realHeight + ((item and item.GetHeight and item:GetHeight()) or itemHeight)
-    end
-
-    local yPos = self.y + Config.Header.size.height + Config.Subtitle.size.height + realHeight + spacing
-
-    local menuWidth = Config.Header.size.width
-
-    local padding = cfg.padding or {}
-    local padLeft = padding.left or (cfg.text and cfg.text.offsetX) or 0
-    local padRight = padding.right or padLeft
-    local padTop = padding.top or (cfg.text and cfg.text.offsetY) or 0
-    local padBottom = padding.bottom or padTop
-
-    local textX = self.x + ((cfg.text and cfg.text.offsetX) or padLeft)
-    local textY = yPos + ((cfg.text and cfg.text.offsetY) or padTop)
-
-    -- Wrap width: si cfg.text.maxWidth n'est pas dÃ©fini, on prend la largeur du menu - padding
-    local wrapWidth = (cfg.text and cfg.text.maxWidth) or (menuWidth - padLeft - padRight)
-
-    -- Auto-size: hauteur en fonction des lignes wrap
-    local cfgLineHeight = (cfg.text and cfg.text.lineHeight) or 19
-
-    local font = tonumber(cfg.text.font) or 0
-    local size = tonumber(cfg.text.size) or 0.35
-
-    -- Use native text height to avoid clipping/overflow when cfgLineHeight is too small.
-    -- Keep config as minimum baseline; add a small leading for safety.
-    local res = Draw.GetResolution()
-    local nativeLineHeight = 0
-    if type(GetTextScaleHeight) == "function" then
-        nativeLineHeight = GetTextScaleHeight(size, font) * res.height
-    elseif type(GetRenderedCharacterHeight) == "function" then
-        nativeLineHeight = GetRenderedCharacterHeight(size, font) * res.height
-    end
-    local lineHeight = math.max(cfgLineHeight, math.ceil(nativeLineHeight) + 2)
-
-    -- ParamÃ¨tres de mesure (rarement modifiÃ©s) â†’ on Ã©vite de reconstruire une clÃ© Ã  chaque frame.
-    local p = self._descMeasureParams
-    if not p
-        or p.font ~= font
-        or p.size ~= size
-        or p.wrapWidth ~= wrapWidth
-        or p.lineHeight ~= lineHeight
-        or p.padTop ~= padTop
-        or p.padBottom ~= padBottom
-    then
-        p = {
-            font = font,
-            size = size,
-            wrapWidth = wrapWidth,
-            lineHeight = lineHeight,
-            padTop = padTop,
-            padBottom = padBottom
-        }
-        self._descMeasureParams = p
-        self._descMeasureParamsKey = table.concat({ tostring(font), tostring(size), tostring(wrapWidth), tostring(lineHeight), tostring(padTop), tostring(padBottom) }, "|")
-    end
-
+    local yPos      = self.y + self._headerHeight + self._subtitleHeight + self._visibleTotalHeight + self._descSpacing
+    local textX     = self._descTextX
+    local textY     = yPos + self._descTextYOff
     local paramsKey = self._descMeasureParamsKey
+    local padTop    = self._descPadTop
+    local padBottom = self._descPadBottom
+    local lineHeight = self._descLineHeight
+    local font      = self._descFont
+    local size      = self._descSize
+    local wrapWidth = self._descWrapWidth
+
     local byParams = self._descMeasureCache[paramsKey]
     if not byParams then
         byParams = {}
         self._descMeasureCache[paramsKey] = byParams
+        self._descCacheSize[paramsKey] = 0
     end
 
     local cached = byParams[description]
-    local lineCount
     local dynamicHeight
     if cached then
-        lineCount = cached.lineCount
         dynamicHeight = cached.height
     else
-        lineCount = Text.GetLineCount(description, textX, textY, font, size, wrapWidth, Text.Align.Left)
+        local lineCount = Text.GetLineCount(description, textX, textY, font, size, wrapWidth, Text.Align.Left)
         lineCount = math.max(1, lineCount)
         dynamicHeight = padTop + padBottom + (lineCount * lineHeight)
+        local n = (self._descCacheSize[paramsKey] or 0) + 1
+        if n >= 50 then
+            byParams = {}
+            self._descMeasureCache[paramsKey] = byParams
+            n = 0
+        end
+        self._descCacheSize[paramsKey] = n
         byParams[description] = { lineCount = lineCount, height = dynamicHeight }
     end
 
-    -- Fond (hauteur dynamique)
-    Draw.Rect(
-        self.x,
-        yPos,
-        menuWidth,
-        dynamicHeight,
-        cfg.background
-    )
-
-    -- Texte (wrap)
-    Text.Draw(
-        description,
-        textX,
-        textY,
-        cfg.text.font,
-        cfg.text.size,
-        cfg.text.color,
-        Text.Align.Left,
-        nil,
-        nil,
-        true,
-        wrapWidth
-    )
+    Draw.Rect(self.x, yPos, self._menuWidth, dynamicHeight, self._descBackground)
+    Text.Draw(description, textX, textY, font, size, self._descTextColor, Text.Align.Left, nil, nil, true, wrapWidth)
+    return yPos + dynamicHeight
 end
 
 
@@ -1071,6 +1316,22 @@ end
 function Menu:Refresh()
     self._dirty = true
     self._needsRecalculate = true
+end
+
+--- Enregistre la closure des panels (style RageUI).
+-- Appelé une fois après la création du menu.
+-- La closure est appelée à chaque frame dans Menu:Draw, APRÈS les items et la description.
+-- À l'intérieur, utilisez les fonctions globales ColorPanel, GridPanel, PercentagePanel,
+-- StatisticsPanel, GridPanelH, GridPanelV avec un paramètre d'index (1-based).
+--
+-- Exemple :
+--   menu:SetPanels(function()
+--       GridPanel(0.5, 0.5, "Haut", "Bas", "Int", "Ext", fn, 2)
+--       ColorPanel("Couleur", colors, minIdx, curIdx, fn, 5)
+--   end)
+---@param fn function
+function Menu:SetPanels(fn)
+    self._panelsFn = type(fn) == "function" and fn or nil
 end
 
 -- Debug

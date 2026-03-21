@@ -1,0 +1,827 @@
+
+
+-- items/checkbox.lua
+-- Hérite de BaseItem.
+--
+-- SYNTAXE UNIFIÉE:
+--   UIMenuCheckbox.New(text, checked, description, enabled, actions)
+--   actions.onChange = function(item) ... end   ← item.checked = true/false
+--   actions.onSelect = function(item) ... end   ← appui Entrée (après toggle)
+
+UIMenuCheckbox = setmetatable({}, { __index = BaseItem })
+UIMenuCheckbox.__index = UIMenuCheckbox
+
+---@param text        string|nil
+---@param checked     boolean|nil
+---@param description string|nil
+---@param enabled     boolean|nil
+---@param actions     table|nil     { onChange=fn, onSelect=fn }
+function UIMenuCheckbox.New(text, checked, description, enabled, actions)
+    local self = BaseItem.New(UIMenuCheckbox, "checkbox", text, description, enabled)
+
+    self.checked          = checked == true
+    self.OnCheckboxChange = Event.New()
+
+    -- Toggle automatique sur Entrée (comportement standard d'une checkbox)
+    self.OnActivated.On(function()
+        self:Toggle()
+        if actions and type(actions.onSelect) == "function" then
+            actions.onSelect(self)
+        end
+    end)
+
+    if actions and type(actions.onChange) == "function" then
+        self.OnCheckboxChange.On(function(it, _)
+            actions.onChange(it)
+        end)
+    end
+
+    return self
+end
+
+function UIMenuCheckbox:SetChecked(value)
+    local new = value == true
+    if new ~= self.checked then
+        self.checked = new
+        self.OnCheckboxChange.Emit(self, self.checked)
+        if self.parent then self.parent._dirty = true end
+    end
+end
+
+function UIMenuCheckbox:Toggle()
+    self:SetChecked(not self.checked)
+end
+
+-- ─── Upvalues (fallback si DrawCustom appelé sans pré-calcul) ─────────────────
+local _cbCfg, _cbMenuW, _cbItemH
+local function CheckboxCfg()
+    if not _cbCfg then
+        _cbCfg   = Config.Checkbox or {}
+        _cbMenuW = Config.Header.size.width
+        _cbItemH = (Config.Layout and Config.Layout.itemHeight) or 35
+    end
+    return _cbCfg, _cbMenuW, _cbItemH
+end
+
+---@param x          number
+---@param y          number
+---@param isSelected boolean
+---@param invW       number|nil  1/resW pre-calcule (pass depuis _DrawItems)
+---@param invH       number|nil  1/resH pre-calcule (pass depuis _DrawItems)
+function UIMenuCheckbox:DrawCustom(x, y, isSelected, invW, invH)
+    -- Fallback si appele directement sans invW/invH
+    if not invW or not invH then
+        invW, invH = Draw.GetInvScale()
+    end
+
+    local isEnabled = (self.enabled == nil) and true or self.enabled
+
+    -- Utilise les valeurs pre-calculees dans _Recalculate si disponibles
+    if self._cbSpriteNX then
+        local spriteName = self.checked and self._cbChecked or self._cbUnchecked
+        local r, g, b, a
+        if not isEnabled then
+            r, g, b, a = self._cbColDisR, self._cbColDisG, self._cbColDisB, self._cbColDisA
+        elseif isSelected then
+            r, g, b, a = self._cbColSelR, self._cbColSelG, self._cbColSelB, self._cbColSelA
+        else
+            r, g, b, a = self._cbColDefR, self._cbColDefG, self._cbColDefB, self._cbColDefA
+        end
+        local cbNY = y * invH + self._cbNYOff
+        Draw.SpriteRaw(self._cbDict, spriteName,
+            self._cbSpriteNX, cbNY, self._cbNW, self._cbNH, 0.0, r, g, b, a)
+        return
+    end
+
+    -- Fallback non-optimise (avant premier _Recalculate)
+    local cfg, menuWidth, itemHeight = CheckboxCfg()
+    local sp = cfg.sprite or {}
+
+    local dict = sp.dict or "commonmenu"
+    local name = self.checked
+        and (sp.checked   or "shop_box_tickb")
+        or  (sp.unchecked or "shop_box_blankb")
+
+    local size    = sp.size or 32
+    local spriteX = x + menuWidth - (sp.offsetRightX or 12) - size
+    local spriteY = sp.offsetY ~= nil
+        and (y + sp.offsetY)
+        or  (y + (itemHeight - size) * 0.5)
+
+    local tint = BaseItem.GetColor(sp.color, isEnabled, isSelected)
+    local tr = tint and tint.r or 255
+    local tg = tint and tint.g or 255
+    local tb = tint and tint.b or 255
+    local ta = tint and tint.a or 255
+
+    Draw.Sprite(dict, name, spriteX, spriteY, size, size, 0.0, tr, tg, tb, ta)
+end
+
+DrawCheckbox = UIMenuCheckbox
+return UIMenuCheckbox
+
+-- items/heritage.lua
+-- Herite de BaseItem. Slider "heritage" avec icones female/male et fill-from-center.
+
+local _heriCfg, _heriItemH
+local function HeriCfg()
+    if not _heriCfg then
+        _heriCfg   = Config.Heritage or {}
+        _heriItemH = (Config.Layout and Config.Layout.itemHeight) or 35
+    end
+    return _heriCfg, _heriItemH
+end
+
+UIMenuSliderHeritageItem = setmetatable({}, { __index = BaseItem })
+UIMenuSliderHeritageItem.__index = UIMenuSliderHeritageItem
+
+---@param text string|nil
+---@param min number|nil
+---@param max number|nil
+---@param value number|nil
+---@param description string|nil
+---@param enabled boolean|nil
+---@param actions table|nil   { step=number, onSelect=fn, onChange=fn }
+function UIMenuSliderHeritageItem.New(text, min, max, value, description, enabled, actions)
+    local self = BaseItem.New(UIMenuSliderHeritageItem, "heritage", text, description, enabled)
+
+    self.min   = min   or 0
+    self.max   = max   or 100
+    self.value = value or 0
+    self._step = (actions and tonumber(actions.step)) or 1
+
+    self.OnProgressChanged = Event.New()
+
+    if actions then
+        if type(actions.onSelect) == "function" then
+            self.OnActivated.On(function()
+                actions.onSelect(self, self.value, self.max)
+            end)
+        end
+        if type(actions.onChange) == "function" then
+            self.OnProgressChanged.On(function(_, val)
+                actions.onChange(self, val)
+            end)
+        end
+    end
+
+    return self
+end
+
+-- Next, Prev, SetValue, SetMax, GetStep → hérités de BaseItem
+
+---@param x          number
+---@param y          number
+---@param selected   boolean
+---@param invW       number|nil  1/resW pre-calcule
+---@param invH       number|nil  1/resH pre-calcule
+function UIMenuSliderHeritageItem:DrawCustom(x, y, selected, invW, invH)
+    if not invW or not invH then
+        invW, invH = Draw.GetInvScale()
+    end
+
+    local isEnabled = (self.enabled == nil) and true or self.enabled
+
+    -- Chemin optimise : valeurs pre-calculees dans _Recalculate
+    if self._hBarNX then
+        local barNY = y * invH + self._hBarNYOff
+
+        -- 1. Fond barre
+        Draw.RectRaw(self._hBarNX, barNY, self._hBarNW, self._hBarNH,
+            self._hBarBgR, self._hBarBgG, self._hBarBgB, self._hBarBgA)
+
+        -- 2. Fill from center
+        local range     = self.max - self.min
+        local centerVal = self._hCenterVal or ((self.min + self.max) * 0.5)
+        local pct       = (range > 0) and ((self.value  - self.min) / range) or 0
+        local centerPct = (range > 0) and ((centerVal   - self.min) / range) or 0.5
+        if pct     < 0 then pct     = 0 elseif pct     > 1 then pct     = 1 end
+        if centerPct < 0 then centerPct = 0 elseif centerPct > 1 then centerPct = 1 end
+
+        -- Conversion en coordonnees normalisees depuis les extremes de la barre
+        local barLeft  = self._hBarNX - self._hBarNW * 0.5
+        local centerNX = barLeft + self._hBarNW * centerPct
+        local valueNX  = barLeft + self._hBarNW * pct
+
+        local fillNX, fillNW
+        if valueNX >= centerNX then
+            fillNW = valueNX - centerNX
+            fillNX = centerNX + fillNW * 0.5
+        else
+            fillNW = centerNX - valueNX
+            fillNX = valueNX  + fillNW * 0.5
+        end
+
+        if fillNW > 0 then
+            Draw.RectRaw(fillNX, barNY, fillNW, self._hBarNH,
+                self._hBarFiR, self._hBarFiG, self._hBarFiB, self._hBarFiA)
+        end
+
+        -- 3. Divider (centre fixe)
+        local divNY = y * invH + self._hDivNYOff
+        local divR, divG, divB, divA
+        if selected then
+            divR, divG, divB, divA = self._hDivSelR, self._hDivSelG, self._hDivSelB, self._hDivSelA
+        else
+            divR, divG, divB, divA = self._hDivDefR, self._hDivDefG, self._hDivDefB, self._hDivDefA
+        end
+        local divCenterNX = self._hBarNX  -- centre de la barre = centre du diviseur
+        Draw.RectRaw(divCenterNX, divNY, self._hDivNW, self._hDivNH, divR, divG, divB, divA)
+
+        -- 4. Icones female/male
+        local iconNY = y * invH + self._hIconNYOff
+        local fR, fG, fB, fA, mR, mG, mB, mA
+        if selected then
+            fR, fG, fB, fA = self._hFemSelR, self._hFemSelG, self._hFemSelB, self._hFemSelA
+            mR, mG, mB, mA = self._hMalSelR, self._hMalSelG, self._hMalSelB, self._hMalSelA
+        else
+            fR, fG, fB, fA = self._hFemDefR, self._hFemDefG, self._hFemDefB, self._hFemDefA
+            mR, mG, mB, mA = self._hMalDefR, self._hMalDefG, self._hMalDefB, self._hMalDefA
+        end
+        Draw.SpriteRaw(self._hIconDict, self._hIconLeft,
+            self._hIconLeftNX,  iconNY, self._hIconNW, self._hIconNH, 0.0, fR, fG, fB, fA)
+        Draw.SpriteRaw(self._hIconDict, self._hIconRight,
+            self._hIconRightNX, iconNY, self._hIconNW, self._hIconNH, 0.0, mR, mG, mB, mA)
+        return
+    end
+
+    -- Fallback non-optimise (avant premier _Recalculate)
+    local C, itemHeight = HeriCfg()
+    local H = Config and Config.Header or {size={width=431}}
+
+    local icon  = tonumber(C.icons and C.icons.size) or 20
+    local gap   = tonumber(C.icons and C.icons.gap)  or 6
+    local barW  = tonumber(C.bar and C.bar.width)     or 120
+    local barH  = tonumber(C.bar and C.bar.height)    or 8
+    local menuW = tonumber(H.size and H.size.width)   or 431
+    local offsetX = tonumber(C.offsetRightX) or 12
+
+    local rightEdge = x + menuW - offsetX
+    local barX = rightEdge - icon - gap - barW
+    local by   = y + (itemHeight - barH) * 0.5
+
+    local barC = C.bar and C.bar.color or {}
+    local bg   = BaseItem.ResolveColor(barC.background, barC.backgroundSelected, barC.backgroundDisabled, isEnabled, selected)
+    if not bg then bg = {r=93,g=182,b=229,a=255} end
+    Draw.Rect(barX, by, barW, barH, bg)
+
+    local range     = self.max - self.min
+    local centerVal = (C.bar and C.bar.centerValue) or ((self.min + self.max) * 0.5)
+    local pct       = (range > 0) and ((self.value  - self.min) / range) or 0
+    local centerPct = (range > 0) and ((centerVal   - self.min) / range) or 0.5
+
+    local centerPx = barX + barW * centerPct
+    local valuePx  = barX + barW * pct
+
+    local fillX, fillW
+    if valuePx >= centerPx then
+        fillX = centerPx
+        fillW = valuePx - centerPx
+    else
+        fillX = valuePx
+        fillW = centerPx - valuePx
+    end
+
+    if fillW > 0 then
+        local fCol = BaseItem.ResolveColor(barC.fill, barC.fillSelected, barC.fillDisabled, isEnabled, selected)
+        if not fCol then fCol = {r=57,g=119,b=200,a=255} end
+        Draw.Rect(fillX, by, fillW, barH, fCol)
+    end
+
+    local div  = C.divider or {}
+    local dW   = tonumber(div.width)  or 2
+    local dH   = tonumber(div.height) or 20
+    local dCol = BaseItem.GetColor(div.color, isEnabled, selected) or {r=0,g=0,b=0,a=255}
+    local centerX = barX + barW * 0.5
+    local divX = centerX - (dW * 0.5)
+    local divY = by + (barH - dH) * 0.5
+    Draw.Rect(divX, divY, dW, dH, dCol)
+
+    local ics  = C.icons or {}
+    local dict = ics.dict or "mpleaderboard"
+    local icC  = ics.color or {}
+    local fC   = icC.female or {}
+    local mC   = icC.male   or {}
+    local _defaultWhite = {r=255,g=255,b=255,a=255}
+    local fColT = (selected and fC.selected or fC.default) or _defaultWhite
+    local mColT = (selected and mC.selected or mC.default) or _defaultWhite
+    local iy = y + (itemHeight - icon) * 0.5
+    Draw.Sprite(dict, ics.left  or "leaderboard_female_icon", barX - gap - icon, iy, icon, icon, 0, fColT.r, fColT.g, fColT.b, fColT.a)
+    Draw.Sprite(dict, ics.right or "leaderboard_male_icon",   barX + barW + gap,  iy, icon, icon, 0, mColT.r, mColT.g, mColT.b, mColT.a)
+end
+
+-- Alias de compatibilité
+DrawSliderHeritage = UIMenuSliderHeritageItem
+
+
+
+-- items/list.lua
+-- Hérite de BaseItem.
+--
+-- SYNTAXE UNIFIÉE:
+--   UIMenuList.New(text, items, index, description, enabled, actions)
+--   actions.onChange = function(item) ... end   ← item.index / item:GetSelectedItem()
+--   actions.onSelect = function(item) ... end   ← appui Entrée
+
+UIMenuList = setmetatable({}, { __index = BaseItem })
+UIMenuList.__index = UIMenuList
+
+---@param text        string|nil
+---@param items       table|nil
+---@param index       number|nil
+---@param description string|nil
+---@param enabled     boolean|nil
+---@param actions     table|nil     { onChange=fn, onSelect=fn }
+function UIMenuList.New(text, items, index, description, enabled, actions)
+    local self = BaseItem.New(UIMenuList, "list", text, description, enabled)
+
+    self.items         = items or {}
+    self.index         = index or 1
+    self.OnListChanged = Event.New()
+
+    if actions then
+        if type(actions.onSelect) == "function" then
+            self.OnActivated.On(function() actions.onSelect(self) end)
+        end
+        if type(actions.onChange) == "function" then
+            self.OnListChanged.On(function(it, _, _)
+                actions.onChange(it)
+            end)
+        end
+    end
+
+    return self
+end
+
+-- ─── Navigation ───────────────────────────────────────────────────────────────
+
+function UIMenuList:SetItems(items)
+    self.items = items or {}
+    self.index = math.min(self.index, math.max(1, #self.items))
+end
+
+function UIMenuList:SetIndex(index)
+    if #self.items == 0 then return end
+    local clamped = math.max(1, math.min(index, #self.items))
+    if clamped ~= self.index then
+        self.index          = clamped
+        self._cachedCaption = nil
+        self._cachedWidth   = nil
+        self.OnListChanged.Emit(self, self.index, self:GetSelectedItem())
+        if self.parent then self.parent._dirty = true end
+    end
+end
+
+function UIMenuList:Next()
+    if #self.items == 0 then return end
+    self:SetIndex(self.index < #self.items and self.index + 1 or 1)
+end
+
+function UIMenuList:Prev()
+    if #self.items == 0 then return end
+    self:SetIndex(self.index > 1 and self.index - 1 or #self.items)
+end
+
+function UIMenuList:GetSelectedItem()
+    if #self.items == 0 then return nil end
+    return self.items[self.index]
+end
+
+-- ─── Upvalues ─────────────────────────────────────────────────────────────────
+local _listCfg, _listMenuW
+local function ListCfg()
+    if not _listCfg then
+        _listCfg   = Config.List or {}
+        _listMenuW = Config.Header.size.width
+    end
+    return _listCfg, _listMenuW
+end
+
+-- ─── Dessin ───────────────────────────────────────────────────────────────────
+
+function UIMenuList:DrawCustom(x, y, isSelected, invW, invH)
+    if #self.items == 0 then return end
+
+    local cfg, menuWidth = ListCfg()
+    local valueCfg = cfg.value or cfg.text or {}
+    local uiCfg    = cfg.ui    or {}
+
+    local isEnabled  = (self.enabled == nil) and true or self.enabled
+    local valueColor = BaseItem.GetColor(valueCfg.color, isEnabled, isSelected)
+
+    -- Utilisation des variables pre-calculees de _Recalculate
+    local font  = self._font or valueCfg.font or 0
+    local size  = self._scale or valueCfg.size or 0.26
+
+    local rawValue   = tostring(self.items[self.index] or "")
+    local showArrows = not (uiCfg.onlyOnSelected == true and not isSelected)
+
+    local drawText = showArrows
+        and ((uiCfg.left or "←") .. " " .. rawValue .. " " .. (uiCfg.right or "→"))
+        or  rawValue
+
+    local nx = self._listValueRightNX or ((x + menuWidth - (valueCfg.offsetRightX or valueCfg.offsetX or 0)) * invW)
+    local ny = y * invH + (self._textNYOff or 0)
+    Text.DrawRaw(drawText, nx, ny, font, size, valueColor.r or 255, valueColor.g or 255, valueColor.b or 255, valueColor.a or 255, 2, nx)
+end
+
+DrawList = UIMenuList
+return UIMenuList
+-- items/progress.lua
+-- Herite de BaseItem. Barre de statut passive (sante, stamina, faim, etc.) — sans fleches.
+
+UIMenuProgressItem = setmetatable({}, { __index = BaseItem })
+UIMenuProgressItem.__index = UIMenuProgressItem
+
+---@param text string
+---@param progressStart number
+---@param progressMax number
+---@param description string
+---@param enabled boolean|nil
+---@param actions table|nil   { onSelect=fn, onChange=fn }
+function UIMenuProgressItem.New(text, progressStart, progressMax, description, enabled, actions)
+	local self = BaseItem.New(UIMenuProgressItem, "progress", text, description, enabled)
+
+	self.max = tonumber(progressMax) or 100
+	if self.max < 0 then self.max = 0 end
+	self.min = 0
+	self.value = BaseItem.Clamp(tonumber(progressStart) or 0, self.min, self.max)
+
+	self.OnProgressChanged = Event.New()
+
+	if actions then
+		if type(actions.onSelect) == "function" then
+			self.OnActivated.On(function()
+				actions.onSelect(self, self.value, self.max)
+			end)
+		end
+		if type(actions.onChange) == "function" then
+			self.OnProgressChanged.On(function(_, value, max)
+				actions.onChange(self, value, max)
+			end)
+		end
+	end
+
+	return self
+end
+
+-- SetEnabled, SetMax, SetValue, GetStep, Next, Prev → tous hérités de BaseItem
+
+-- Upvalues: fallback si DrawCustom appelé sans pré-calcul
+local _progCfg, _progMenuW, _progItemH
+
+local function ProgressCfg()
+	if not _progCfg then
+		_progCfg   = Config.Progress or {}
+		_progMenuW = Config.Header.size.width
+		_progItemH = (Config.Layout and Config.Layout.itemHeight) or 35
+	end
+	return _progCfg, _progMenuW, _progItemH
+end
+
+---@param x          number
+---@param y          number
+---@param isSelected boolean
+---@param invW       number|nil  1/resW pre-calcule
+---@param invH       number|nil  1/resH pre-calcule
+function UIMenuProgressItem:DrawCustom(x, y, isSelected, invW, invH)
+	if not invW or not invH then
+		invW, invH = Draw.GetInvScale()
+	end
+
+	local isEnabled = (self.enabled == nil) and true or self.enabled
+
+	-- Chemin optimise : valeurs pre-calculees dans _Recalculate
+	if self._barNX then
+		local barNY  = y * invH + self._barNYOff
+		local ratio  = (self.max > 0) and (self.value / self.max) or 0
+		if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
+
+		-- progress n'a pas de variantes selected/disabled dans le plan — on utilise les valeurs de base
+		Draw.RectRaw(self._barNX, barNY, self._barNW, self._barNH,
+			self._barBgR, self._barBgG, self._barBgB, self._barBgA)
+
+		local fillNW = self._barNW * ratio
+		if fillNW > 0 then
+			local fillNX = self._barNX - self._barNW * 0.5 + fillNW * 0.5
+			Draw.RectRaw(fillNX, barNY, fillNW, self._barNH,
+				self._barFiR, self._barFiG, self._barFiB, self._barFiA)
+		end
+		return
+	end
+
+	-- Fallback non-optimise (avant premier _Recalculate)
+	local cfg, menuWidth, itemHeight = ProgressCfg()
+	local bar = cfg.bar or {}
+
+	local width = (self.style and tonumber(self.style.width)) or bar.width or 120
+	local barH  = (self.style and tonumber(self.style.height)) or tonumber(bar.height) or 8
+	local rectCfg = bar.rectangle
+	if rectCfg then
+		local bk = rectCfg.black
+		if bk and bk.height then barH = tonumber(bk.height) or barH end
+	end
+	if width < 0 then width = 0 end
+	if barH  < 0 then barH  = 0 end
+
+	local offsetRightX = bar.offsetRightX or 12
+	local offsetY = (bar.offsetY ~= nil) and bar.offsetY or ((itemHeight - barH) * 0.5)
+
+	local barX = x + menuWidth - offsetRightX - width
+	local barY = y + offsetY
+
+	local colors = bar.color or {}
+	local bgColor   = BaseItem.ResolveColor(colors.background, colors.backgroundSelected, colors.backgroundDisabled, isEnabled, isSelected)
+	local fillColor = BaseItem.ResolveColor(colors.fill,       colors.fillSelected,       colors.fillDisabled,       isEnabled, isSelected)
+
+	if bgColor then Draw.Rect(barX, barY, width, barH, bgColor) end
+
+	local ratio = (self.max > 0) and (self.value / self.max) or 0
+	if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
+	local fillW = width * ratio
+	if fillW > 0 and fillColor then Draw.Rect(barX, barY, fillW, barH, fillColor) end
+end
+
+-- Alias explicite
+DrawProgress = UIMenuProgressItem
+
+return UIMenuProgressItem
+
+-- items/slider.lua
+-- Herite de BaseItem. Barre de progression controlee avec Left/Right.
+
+UIMenuSliderProgress = setmetatable({}, { __index = BaseItem })
+UIMenuSliderProgress.__index = UIMenuSliderProgress
+
+---@param text string
+---@param progressStart number
+---@param progressMax number
+---@param description string
+---@param enabled boolean|nil
+---@param actions table|nil   { onSelect=fn, onChange=fn, step=number }
+function UIMenuSliderProgress.New(text, progressStart, progressMax, description, enabled, actions)
+	local self = BaseItem.New(UIMenuSliderProgress, "sliderprogress", text, description, enabled)
+
+	self.max = tonumber(progressMax) or 100
+	if self.max < 0 then self.max = 0 end
+	self.min = 0
+	self.value = BaseItem.Clamp(tonumber(progressStart) or 0, self.min, self.max)
+	self._step = (actions and tonumber(actions.step)) or 1
+
+	self.OnProgressChanged = Event.New()
+
+	if actions then
+		if type(actions.onSelect) == "function" then
+			self.OnActivated.On(function()
+				actions.onSelect(self, self.value, self.max)
+			end)
+		end
+		if type(actions.onChange) == "function" then
+			self.OnProgressChanged.On(function(_, value, max)
+				actions.onChange(self, value, max)
+			end)
+		end
+	end
+
+	return self
+end
+
+-- SetEnabled, SetMax, SetValue, GetStep, Next, Prev → tous hérités de BaseItem
+
+-- Upvalues: fallback si DrawCustom appelé sans pré-calcul
+local _sliderCfg, _sliderMenuW, _sliderItemH
+
+local function SliderCfg()
+	if not _sliderCfg then
+		_sliderCfg   = Config.SliderProgress or {}
+		_sliderMenuW = Config.Header.size.width
+		_sliderItemH = (Config.Layout and Config.Layout.itemHeight) or 35
+	end
+	return _sliderCfg, _sliderMenuW, _sliderItemH
+end
+
+---@param x          number
+---@param y          number
+---@param isSelected boolean
+---@param invW       number|nil  1/resW pre-calcule
+---@param invH       number|nil  1/resH pre-calcule
+function UIMenuSliderProgress:DrawCustom(x, y, isSelected, invW, invH)
+	if not invW or not invH then
+		invW, invH = Draw.GetInvScale()
+	end
+
+	local isEnabled = (self.enabled == nil) and true or self.enabled
+
+	-- Chemin optimise : valeurs pre-calculees dans _Recalculate
+	if self._barNX then
+		local barNY = y * invH + self._barNYOff
+		local ratio = (self.max > 0) and (self.value / self.max) or 0
+		if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
+
+		local bgR, bgG, bgB, bgA, fiR, fiG, fiB, fiA
+		if not isEnabled then
+			bgR, bgG, bgB, bgA = self._barBgDR, self._barBgDG, self._barBgDB, self._barBgDA
+			fiR, fiG, fiB, fiA = self._barFiDR, self._barFiDG, self._barFiDB, self._barFiDA
+		elseif isSelected then
+			bgR, bgG, bgB, bgA = self._barBgSR, self._barBgSG, self._barBgSB, self._barBgSA
+			fiR, fiG, fiB, fiA = self._barFiSR, self._barFiSG, self._barFiSB, self._barFiSA
+		else
+			bgR, bgG, bgB, bgA = self._barBgR, self._barBgG, self._barBgB, self._barBgA
+			fiR, fiG, fiB, fiA = self._barFiR, self._barFiG, self._barFiB, self._barFiA
+		end
+
+		-- Fond
+		Draw.RectRaw(self._barNX, barNY, self._barNW, self._barNH, bgR, bgG, bgB, bgA)
+
+		-- Fill (aligne a gauche du fond)
+		local fillNW = self._barNW * ratio
+		if fillNW > 0 then
+			local fillNX = self._barNX - self._barNW * 0.5 + fillNW * 0.5
+			Draw.RectRaw(fillNX, barNY, fillNW, self._barNH, fiR, fiG, fiB, fiA)
+		end
+		return
+	end
+
+	-- Fallback non-optimise (avant premier _Recalculate)
+	local cfg, menuWidth, itemHeight = SliderCfg()
+	local bar = cfg.bar or {}
+
+	local width   = bar.width or 120
+	local barH    = tonumber(bar.height) or 8
+	local rectCfg = bar.rectangle
+	if rectCfg then
+		local bk = rectCfg.black
+		if bk and bk.height then barH = tonumber(bk.height) or barH end
+	end
+	if width < 0 then width = 0 end
+	if barH  < 0 then barH  = 0 end
+
+	local offsetRightX = bar.offsetRightX or 12
+	local offsetY = (bar.offsetY ~= nil) and bar.offsetY or ((itemHeight - barH) * 0.5)
+
+	local barX = x + menuWidth - offsetRightX - width
+	local barY = y + offsetY
+
+	local colors = bar.color or {}
+	local bgColor   = BaseItem.ResolveColor(colors.background,   colors.backgroundSelected,   colors.backgroundDisabled,   isEnabled, isSelected)
+	local fillColor = BaseItem.ResolveColor(colors.fill,         colors.fillSelected,         colors.fillDisabled,         isEnabled, isSelected)
+
+	if bgColor then Draw.Rect(barX, barY, width, barH, bgColor) end
+
+	local ratio = (self.max > 0) and (self.value / self.max) or 0
+	if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
+	local fillW = width * ratio
+	if fillW > 0 and fillColor then Draw.Rect(barX, barY, fillW, barH, fillColor) end
+
+	if bar.showValue == true then
+		local valueText = string.format("%d/%d", math.floor(self.value), math.floor(self.max))
+		local valueCfg = cfg.value or {}
+		local tx = x + menuWidth - (valueCfg.offsetRightX or offsetRightX)
+		local ty = y + (valueCfg.offsetY or 7)
+		local color = BaseItem.GetColor(valueCfg.color, isEnabled, isSelected)
+		Text.Draw(valueText, tx, ty, valueCfg.font or 0, valueCfg.size or 0.26, color, Text.Align.Right)
+	end
+end
+
+-- Alias explicite
+DrawSliderProgress = UIMenuSliderProgress
+
+return UIMenuSliderProgress
+
+---@diagnostic disable: undefined-global
+-- items/windows.lua
+-- UIMenuWindowHeritageItem — Panneau portrait mère/père (style NativeUI Heritage Window)
+--
+-- SYNTAXE:
+--   local win = UIMenuWindowHeritageItem.New(mumIndex, dadIndex)
+--   win:SetMum(3)        -- changer la mère  (0-20)
+--   win:SetDad(7)        -- changer le père  (0-23)
+--   win:heritage(3, 7)   -- raccourci SetMum + SetDad
+--
+-- Sprites GTA V natifs :
+--   dict mère/père  → "char_creator_portraits"  /  "female_0".."female_20", "male_0".."male_23"
+--   dict fond       → "pause_menu_pages_char_mom_dad" / "mumdadbg"
+
+UIMenuWindowHeritageItem = setmetatable({}, { __index = BaseItem })
+UIMenuWindowHeritageItem.__index = UIMenuWindowHeritageItem
+
+-- ─── Upvalues config (lazy, 0 lookup par frame) ───────────────────────────────
+local _winCfg, _winMenuW
+local _winH
+local _winBgDict, _winBgName, _winBgHeading, _winBgR, _winBgG, _winBgB, _winBgA
+local _winPortDict
+local _winMomSize, _winMomOffX, _winMomPrefix, _winMomSpecPrefix, _winMomR, _winMomG, _winMomB, _winMomA
+local _winDadSize, _winDadOffX, _winDadPrefix, _winDadSpecPrefix, _winDadR, _winDadG, _winDadB, _winDadA
+local function WinCfg()
+    if not _winCfg then
+        _winCfg   = Config.Window or {}
+        _winMenuW = (Config.Header and Config.Header.size and Config.Header.size.width) or 431
+        _winH     = (_winCfg.size and _winCfg.size.height) or 155
+        local bg  = _winCfg.background or {}
+        _winBgDict, _winBgName, _winBgHeading = bg.dict or "pause_menu_pages_char_mom_dad", bg.name or "mumdadbg", bg.heading or 0.0
+        local bc  = bg.color or { r=255, g=255, b=255, a=255 }
+        _winBgR, _winBgG, _winBgB, _winBgA = bc.r or 255, bc.g or 255, bc.b or 255, bc.a or 255
+        local port   = _winCfg.portraits or {}
+        _winPortDict = port.dict or "char_creator_portraits"
+        local mom = port.mom or {}
+        _winMomSize, _winMomOffX = mom.size or 75, mom.offsetX or 65
+        _winMomPrefix, _winMomSpecPrefix = mom.prefix or "female_", "special_female_"
+        local mc  = mom.color or { r=255, g=255, b=255, a=255 }
+        _winMomR, _winMomG, _winMomB, _winMomA = mc.r or 255, mc.g or 255, mc.b or 255, mc.a or 255
+        local dad = port.dad or {}
+        _winDadSize, _winDadOffX = dad.size or 75, dad.offsetX or 65
+        _winDadPrefix, _winDadSpecPrefix = dad.prefix or "male_", "special_male_"
+        local dc  = dad.color or { r=255, g=255, b=255, a=255 }
+        _winDadR, _winDadG, _winDadB, _winDadA = dc.r or 255, dc.g or 255, dc.b or 255, dc.a or 255
+    end
+    return _winCfg, _winMenuW
+end
+
+-- Résout le nom de sprite selon l'index :
+--   mère  0-20 → "female_X"       index 21    → "special_female_0"
+--   père  0-20 → "male_X"         indices 21-23 → "special_male_0".."special_male_2"
+local function ResolveSprite(index, stdPrefix, specPrefix, specialStart)
+    if index < specialStart then
+        return stdPrefix .. tostring(index)
+    else
+        return specPrefix .. tostring(index - specialStart)
+    end
+end
+
+-- ─── Constructeur ─────────────────────────────────────────────────────────────
+
+---@param mumIndex number|nil  Index mère  0-20 (défaut 0)
+---@param dadIndex number|nil  Index père  0-20 (défaut 0)
+function UIMenuWindowHeritageItem.New(mumIndex, dadIndex)
+    local self = BaseItem.New(UIMenuWindowHeritageItem, "window", "", nil, true)
+
+    self.mumIndex = math.max(0, math.min(21, tonumber(mumIndex) or 0))
+    self.dadIndex = math.max(0, math.min(23, tonumber(dadIndex) or 0))
+
+    -- Pré-charger le dict portraits (non-bloquant)
+    local dict = ((Config.Window or {}).portraits or {}).dict or "char_creator_portraits"
+    RequestStreamedTextureDict(dict, false)
+
+    return self
+end
+
+-- ─── Méthodes ─────────────────────────────────────────────────────────────────
+
+--- Mettre à jour l'index mère et forcer le redraw
+---@param index number 0-20
+function UIMenuWindowHeritageItem:SetMum(index)
+    local v = math.max(0, math.min(21, tonumber(index) or 0))
+    if self.mumIndex ~= v then
+        self.mumIndex = v
+        if self.parent then self.parent._dirty = true end
+    end
+end
+
+--- Mettre à jour l'index père et forcer le redraw
+---@param index number 0-23
+function UIMenuWindowHeritageItem:SetDad(index)
+    local v = math.max(0, math.min(23, tonumber(index) or 0))
+    if self.dadIndex ~= v then
+        self.dadIndex = v
+        if self.parent then self.parent._dirty = true end
+    end
+end
+
+--- Raccourci : mettre à jour mère ET père en une seule ligne
+---@param mumIndex number 0-20
+---@param dadIndex number 0-23
+function UIMenuWindowHeritageItem:heritage(mumIndex, dadIndex)
+    self:SetMum(mumIndex)
+    self:SetDad(dadIndex)
+end
+
+--- Override hauteur : le panneau est plus haut qu'un item normal
+---@return number hauteur en px
+function UIMenuWindowHeritageItem:GetHeight()
+    WinCfg()
+    return _winH
+end
+
+-- ─── Rendu ────────────────────────────────────────────────────────────────────
+
+function UIMenuWindowHeritageItem:DrawCustom(x, y)
+    WinCfg()
+
+    -- Fond du panneau (EnsureTexture gère le streaming en interne)
+    Draw.Sprite(_winBgDict, _winBgName, x, y, _winMenuW, _winH, _winBgHeading,
+        _winBgR, _winBgG, _winBgB, _winBgA)
+
+    -- Portraits (EnsureTexture + textureState cache — pas de HasStreamedTextureDictLoaded)
+    local momSprite  = ResolveSprite(self.mumIndex, _winMomPrefix, _winMomSpecPrefix, 21)
+    local momX       = x + _winMomOffX
+    local momY       = y + (_winH - _winMomSize) * 0.9
+    Draw.Sprite(_winPortDict, momSprite, momX, momY, _winMomSize, _winMomSize, 0.5,
+        _winMomR, _winMomG, _winMomB, _winMomA)
+
+    local dadSprite  = ResolveSprite(self.dadIndex, _winDadPrefix, _winDadSpecPrefix, 21)
+    local dadX       = x + _winMenuW - _winDadOffX - _winDadSize
+    local dadY       = y + (_winH - _winDadSize) * 0.9
+    Draw.Sprite(_winPortDict, dadSprite, dadX, dadY, _winDadSize, _winDadSize, 0.5,
+        _winDadR, _winDadG, _winDadB, _winDadA)
+end
+

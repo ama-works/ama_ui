@@ -1,0 +1,17 @@
+-- ============================================================================
+-- ui/imports.lua
+-- Export du shared object pour les resources externes
+--
+-- Usage depuis une autre resource (client_script uniquement) :
+--   ama_ui = exports["ama_ui"]:getSharedObject()
+--
+-- Exemple dans une resource externe :
+--   -- fxmanifest.lua : dependency 'ama_ui'
+--   -- client.lua     : ama_ui = exports["ama_ui"]:getSharedObject()
+--   local menu = ama_ui.CreateMenu("Titre", "Sous-titre")
+--   menu:Button("Bouton", "desc", { onSelected = function() end })
+--   ama_ui.Visible(menu)
+-- ============================================================================
+ --exports('getSharedObject', function()
+  --  return ama_ui
+--end)

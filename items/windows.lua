@@ -17,10 +17,32 @@ UIMenuWindowHeritageItem.__index = UIMenuWindowHeritageItem
 
 -- ─── Upvalues config (lazy, 0 lookup par frame) ───────────────────────────────
 local _winCfg, _winMenuW
+local _winH
+local _winBgDict, _winBgName, _winBgHeading, _winBgR, _winBgG, _winBgB, _winBgA
+local _winPortDict
+local _winMomSize, _winMomOffX, _winMomPrefix, _winMomSpecPrefix, _winMomR, _winMomG, _winMomB, _winMomA
+local _winDadSize, _winDadOffX, _winDadPrefix, _winDadSpecPrefix, _winDadR, _winDadG, _winDadB, _winDadA
 local function WinCfg()
     if not _winCfg then
         _winCfg   = Config.Window or {}
         _winMenuW = (Config.Header and Config.Header.size and Config.Header.size.width) or 431
+        _winH     = (_winCfg.size and _winCfg.size.height) or 155
+        local bg  = _winCfg.background or {}
+        _winBgDict, _winBgName, _winBgHeading = bg.dict or "pause_menu_pages_char_mom_dad", bg.name or "mumdadbg", bg.heading or 0.0
+        local bc  = bg.color or { r=255, g=255, b=255, a=255 }
+        _winBgR, _winBgG, _winBgB, _winBgA = bc.r or 255, bc.g or 255, bc.b or 255, bc.a or 255
+        local port   = _winCfg.portraits or {}
+        _winPortDict = port.dict or "char_creator_portraits"
+        local mom = port.mom or {}
+        _winMomSize, _winMomOffX = mom.size or 75, mom.offsetX or 65
+        _winMomPrefix, _winMomSpecPrefix = mom.prefix or "female_", "special_female_"
+        local mc  = mom.color or { r=255, g=255, b=255, a=255 }
+        _winMomR, _winMomG, _winMomB, _winMomA = mc.r or 255, mc.g or 255, mc.b or 255, mc.a or 255
+        local dad = port.dad or {}
+        _winDadSize, _winDadOffX = dad.size or 75, dad.offsetX or 65
+        _winDadPrefix, _winDadSpecPrefix = dad.prefix or "male_", "special_male_"
+        local dc  = dad.color or { r=255, g=255, b=255, a=255 }
+        _winDadR, _winDadG, _winDadB, _winDadA = dc.r or 255, dc.g or 255, dc.b or 255, dc.a or 255
     end
     return _winCfg, _winMenuW
 end
@@ -86,52 +108,29 @@ end
 --- Override hauteur : le panneau est plus haut qu'un item normal
 ---@return number hauteur en px
 function UIMenuWindowHeritageItem:GetHeight()
-    local cfg = WinCfg()
-    return (cfg.size and cfg.size.height) or 155
+    WinCfg()
+    return _winH
 end
 
 -- ─── Rendu ────────────────────────────────────────────────────────────────────
 
 function UIMenuWindowHeritageItem:DrawCustom(x, y)
-    local cfg, menuW = WinCfg()
-    menuW = menuW or 431
+    WinCfg()
 
-    local panelH = (cfg.size and cfg.size.height) or 155
+    -- Fond du panneau (EnsureTexture gère le streaming en interne)
+    Draw.Sprite(_winBgDict, _winBgName, x, y, _winMenuW, _winH, _winBgHeading,
+        _winBgR, _winBgG, _winBgB, _winBgA)
 
-    -- ── 1. Fond du panneau ──────────────────────────────────────────────────
-    -- Pour désactiver le sprite : mettre background.dict = nil dans Config.Window
-    local bg     = cfg.background or {}
-    local bgDict = bg.dict or "pause_menu_pages_char_mom_dad"
-    local bgName = bg.name or "mumdadbg"
-    local bc     = bg.color or { r = 255, g = 255, b = 255, a = 255 }
-    Draw.Sprite(bgDict, bgName, x, y, menuW, panelH, bg.heading or 0.0,
-        bc.r, bc.g, bc.b, bc.a)
+    -- Portraits (EnsureTexture + textureState cache — pas de HasStreamedTextureDictLoaded)
+    local momSprite  = ResolveSprite(self.mumIndex, _winMomPrefix, _winMomSpecPrefix, 21)
+    local momX       = x + _winMomOffX
+    local momY       = y + (_winH - _winMomSize) * 0.9
+    Draw.Sprite(_winPortDict, momSprite, momX, momY, _winMomSize, _winMomSize, 0.5,
+        _winMomR, _winMomG, _winMomB, _winMomA)
 
-    -- ── 2. Portraits ────────────────────────────────────────────────────────
-    local port = cfg.portraits or {}
-    local dict = port.dict or "char_creator_portraits"
-
-    -- S'assurer que le dict est streamé (non-bloquant, 1 appel par frame max)
-    if not HasStreamedTextureDictLoaded(dict) then
-        RequestStreamedTextureDict(dict, false)
-        return  -- on attend le chargement, rien à dessiner cette frame
-    end
-
-    -- Portrait mère (gauche) — taille depuis mom.size
-    local momCfg    = port.mom or {}
-    local momSize   = momCfg.size or 75
-    local momX      = x + (momCfg.offsetX or 65)
-    local momCentreY = y + (panelH - momSize) * 0.5
-    local mc        = momCfg.color or { r = 255, g = 255, b = 255, a = 255 }
-    local momSprite = ResolveSprite(self.mumIndex, momCfg.prefix or "female_", "special_female_", 21)
-    Draw.Sprite(dict, momSprite, momX, momCentreY, momSize, momSize, 0.5, mc.r, mc.g, mc.b, mc.a)
-
-    -- Portrait père (droite, symétrique) — taille depuis dad.size
-    local dadCfg    = port.dad or {}
-    local dadSize   = dadCfg.size or 75
-    local dadX      = x + menuW - (dadCfg.offsetX or 65) - dadSize
-    local dadCentreY = y + (panelH - dadSize) * 0.5
-    local dc        = dadCfg.color or { r = 255, g = 255, b = 255, a = 255 }
-    local dadSprite = ResolveSprite(self.dadIndex, dadCfg.prefix or "male_", "special_male_", 21)
-    Draw.Sprite(dict, dadSprite, dadX, dadCentreY, dadSize, dadSize, 0.5, dc.r, dc.g, dc.b, dc.a)
+    local dadSprite  = ResolveSprite(self.dadIndex, _winDadPrefix, _winDadSpecPrefix, 21)
+    local dadX       = x + _winMenuW - _winDadOffX - _winDadSize
+    local dadY       = y + (_winH - _winDadSize) * 0.9
+    Draw.Sprite(_winPortDict, dadSprite, dadX, dadY, _winDadSize, _winDadSize, 0.5,
+        _winDadR, _winDadG, _winDadB, _winDadA)
 end

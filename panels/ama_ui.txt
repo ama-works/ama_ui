@@ -1,0 +1,878 @@
+-- panels/base.lua
+-- Classe de base pour tous les panels ama_ui.
+-- Un panel est un item non-navigable dessiné via DrawCustom (pas de label, pas de highlight).
+-- Hériter : MonPanel = setmetatable({}, { __index = PanelBase }) puis surcharger DrawCustom et GetHeight.
+
+PanelBase = {}
+PanelBase.__index = PanelBase
+
+---@param panelClass table
+---@param height number|nil  hauteur en pixels (défaut 100)
+function PanelBase.New(panelClass, height)
+    local self = setmetatable({}, panelClass)
+    self.id      = GenerateUUID()   -- même pattern que BaseItem
+    self.type    = "panel"          -- reconnu par menu.lua comme non-navigable
+    self.parent  = nil              -- défini par Menu:AddItem
+    self._height = height or 100
+    return self
+end
+
+--- Retourne la hauteur du panel en pixels.
+--- Surcharger dans les sous-classes si la hauteur est dynamique.
+function PanelBase:GetHeight()
+    return self._height
+end
+
+--- Dessin du panel. Appelé par menu.lua via DrawCustom(x, y).
+--- x, y : coin top-left du panel (pixels normalisés GTA).
+--- Surcharger dans chaque sous-classe.
+function PanelBase:DrawCustom(x, y)
+end
+
+--- Nettoyage mémoire.
+function PanelBase:Destroy()
+    self.parent = nil
+    setmetatable(self, nil)
+end
+
+return PanelBase
+
+-- panels/color_panel.lua
+-- ColorPanel conforme à RageUI.ColourPanel (UIColourPanel.lua)
+--
+-- Signature : ColorPanel(title, colors, minIdx, curIdx, callback, index)
+-- callback(hovered, active, newMinIdx, newCurIdx)
+--
+-- colors : table de {r, g, b} ou {r, g, b, a}  (format PanelColour.HairCut)
+-- minIdx : premier index visible dans la fenêtre glissante (1-based)
+-- curIdx : index sélectionné (1-based)
+-- index  : numéro de l'item associé (currentItem doit être == index pour afficher)
+--
+-- Utilisation typique (dans menu:SetPanels) :
+--   local minIdx, curIdx = 1, 1
+--   menu:SetPanels(function()
+--       ColorPanel("Couleur", RageUI.PanelColour.HairCut, minIdx, curIdx, function(h, a, newMin, newCur)
+--           minIdx = newMin
+--           curIdx = newCur
+--       end, 5)
+--   end)
+
+-- ─── Config (Config.ColorPanel) ───────────────────────────────────────────────
+local _cfgCP = Config.ColorPanel
+
+local _CP_BG  = { Dict = _cfgCP.sprite.dict, Tex = _cfgCP.sprite.name,
+                  Y    = _cfgCP.background.offsetY, H = _cfgCP.background.height }
+local _CP_LA  = { Dict = "commonmenu", Tex = "arrowleft",
+                  X    = _cfgCP.arrowLeft.offsetX,  Y = _cfgCP.arrowLeft.offsetY,
+                  W    = _cfgCP.arrowLeft.width,    H = _cfgCP.arrowLeft.height }
+local _CP_RA  = { Dict = "commonmenu", Tex = "arrowright",
+                  Y    = _cfgCP.arrowRight.offsetY, W = _cfgCP.arrowRight.width,
+                  H    = _cfgCP.arrowRight.height,  _padRight = _cfgCP.arrowRight.padRight }
+local _CP_HDR = { Y = _cfgCP.header.offsetY, Scale = _cfgCP.header.size }
+local _CP_BOX = { X = _cfgCP.box.offsetX,       Y = _cfgCP.box.offsetY,
+                  W = _cfgCP.box.width,          H = _cfgCP.box.height }
+local _CP_SEL = { X = _cfgCP.selection.offsetX,  Y = _cfgCP.selection.offsetY,
+                  W = _cfgCP.selection.width,    H = _cfgCP.selection.height }
+
+local _CP_WHITE = _cfgCP.color.text
+local _CP_TOTAL = _CP_BG.H + _CP_BG.Y
+
+-- Table couleur réutilisable — évite 9 allocs GC par frame dans la boucle des carrés
+local _cp_color = { r = 0, g = 0, b = 0, a = 255 }
+-- Cache titre — évite string concat à chaque frame
+local _cp_lastTitle, _cp_lastCurIdx, _cp_lastTotal, _cp_cachedTitle
+
+---ColorPanel conforme RageUI.ColourPanel
+---@param Title      string
+---@param Colours    table     table de {r,g,b} ou {r,g,b,a}
+---@param MinIdx     number    premier index visible (1-based)
+---@param CurIdx     number    index sélectionné (1-based)
+---@param Callback   function  callback(hovered, active, newMinIdx, newCurIdx)
+---@param Index      number|nil  index de l'item associé (nil = toujours visible)
+---@param MouseOnly  boolean|nil  true = navigation souris uniquement (désactive clavier ←→)
+function ColorPanel(Title, Colours, MinIdx, CurIdx, Callback, Index, MouseOnly)
+    if not _AmaUIPanelMenu then return end
+    if Index ~= nil and _AmaUIPanelMenu.currentItem ~= Index then return end
+
+    local x     = _AmaUIPanelX
+    local y     = _AmaUIPanelY
+    local menuW = _AmaUIPanelMenu._menuWidth
+    local total = #Colours
+    -- Nombre de cases visibles dynamique (chaque case = 37.5px, marge gauche 42, droite 37.5)
+    local Max   = math.min(total, math.max(1, math.floor((menuW - 79.5) / _CP_BOX.W)))
+    local raX   = menuW - _CP_RA._padRight      -- flèche droite
+    local hdrX  = menuW * 0.5                   -- titre centré
+
+    -- ─── Background sprite ────────────────────────────────────────────────────
+    Draw.Sprite(_CP_BG.Dict, _CP_BG.Tex,
+        x, y + _CP_BG.Y, menuW, _CP_BG.H, 0, 255, 255, 255, 255)
+
+    -- ─── Flèches gauche / droite ──────────────────────────────────────────────
+    Draw.Sprite(_CP_LA.Dict, _CP_LA.Tex,
+        x + _CP_LA.X, y + _CP_LA.Y, _CP_LA.W, _CP_LA.H, 0, 255, 255, 255, 255)
+    Draw.Sprite(_CP_RA.Dict, _CP_RA.Tex,
+        x + raX, y + _CP_RA.Y, _CP_RA.W, _CP_RA.H, 0, 255, 255, 255, 255)
+
+    -- ─── Barre blanche de sélection (sous le carré actif) ────────────────────
+    Draw.Rect(
+        x + _CP_SEL.X + (_CP_BOX.W * (CurIdx - MinIdx)),
+        y + _CP_SEL.Y,
+        _CP_SEL.W, _CP_SEL.H, _CP_WHITE)
+
+    -- ─── Carrés de couleur (max 9 visibles, fenêtre glissante) ───────────────
+    for i = 1, Max do
+        local c = Colours[MinIdx + i - 1]
+        if c then
+            _cp_color.r = c[1]
+            _cp_color.g = c[2]
+            _cp_color.b = c[3]
+            _cp_color.a = c[4] or 255
+            Draw.Rect(
+                x + _CP_BOX.X + (_CP_BOX.W * (i - 1)),
+                y + _CP_BOX.Y,
+                _CP_BOX.W, _CP_BOX.H, _cp_color)
+        end
+    end
+
+    -- ─── Titre centré : "Label (curIdx of total)" ────────────────────────────
+    local t = Title or ""
+    if t ~= _cp_lastTitle or CurIdx ~= _cp_lastCurIdx or total ~= _cp_lastTotal then
+        _cp_lastTitle  = t
+        _cp_lastCurIdx = CurIdx
+        _cp_lastTotal  = total
+        _cp_cachedTitle = t .. " (" .. CurIdx .. " of " .. total .. ")"
+    end
+    Text.Draw(_cp_cachedTitle, x + hdrX, y + _CP_HDR.Y, 0, _CP_HDR.Scale, _CP_WHITE, 1)
+
+    -- ─── Navigation gauche / droite ───────────────────────────────────────────
+    local Hovered = false
+    local Active  = false
+
+    if not MouseOnly and (Index == nil or _AmaUIPanelMenu.currentItem == Index) then
+        if IsControlJustPressed(0, 174) then        -- LEFT
+            CurIdx = CurIdx - 1
+            if CurIdx < 1 then
+                CurIdx = total
+                MinIdx = total - Max + 1
+            elseif CurIdx < MinIdx then
+                MinIdx = MinIdx - 1
+            end
+            Active = true
+        elseif IsControlJustPressed(0, 175) then    -- RIGHT
+            CurIdx = CurIdx + 1
+            if CurIdx > total then
+                CurIdx = 1
+                MinIdx = 1
+            elseif CurIdx > MinIdx + Max - 1 then
+                MinIdx = MinIdx + 1
+            end
+            Active = true
+        end
+    end
+
+    -- ─── Interaction souris sur les flèches ───────────────────────────────────
+    local mouseX = GetDisabledControlNormal(0, 239) * 1920
+    local mouseY = GetDisabledControlNormal(0, 240) * 1080
+
+    local laTop = y + _CP_LA.Y
+    local raTop = y + _CP_RA.Y
+    local overLeft  = mouseX >= (x + _CP_LA.X) and mouseX <= (x + _CP_LA.X + _CP_LA.W)
+                      and mouseY >= laTop and mouseY <= (laTop + _CP_LA.H)
+    local overRight = mouseX >= (x + raX) and mouseX <= (x + raX + _CP_RA.W)
+                      and mouseY >= raTop and mouseY <= (raTop + _CP_RA.H)
+
+    if overLeft or overRight then
+        SetMouseCursorActiveThisFrame()
+        Hovered = true
+        if IsDisabledControlJustPressed(0, 24) then
+            if overLeft then
+                CurIdx = CurIdx - 1
+                if CurIdx < 1 then CurIdx = total; MinIdx = total - Max + 1
+                elseif CurIdx < MinIdx then MinIdx = MinIdx - 1 end
+            else
+                CurIdx = CurIdx + 1
+                if CurIdx > total then CurIdx = 1; MinIdx = 1
+                elseif CurIdx > MinIdx + Max - 1 then MinIdx = MinIdx + 1 end
+            end
+            Active = true
+        end
+    end
+
+    -- Avance le curseur Y pour le prochain panel
+    _AmaUIPanelY = _AmaUIPanelY + _CP_TOTAL
+
+    if Callback then
+        Callback(Hovered, Active, MinIdx, CurIdx)
+    end
+end
+-- panels/grid_panel.lua
+-- GridPanel conforme à RageUI.GridPanel (UIGridPanel.lua)
+--
+-- Signature : GridPanel(x, y, topText, bottomText, leftText, rightText, callback, index)
+-- callback(hovered, active, x, y)  — x, y dans [0.0, 1.0]
+--
+-- Sprite grille : pause_menu_pages_char_mom_dad/nose_grid
+-- Sprite cercle : mpinventory/in_world_circle
+--
+-- Utilisation typique (dans menu:SetPanels) :
+--   local gx, gy = 0.5, 0.5
+--   menu:SetPanels(function()
+--       GridPanel(gx, gy, "Haut", "Bas", "Int", "Ext", function(h, a, nx, ny)
+--           gx, gy = nx, ny
+--       end, 2)
+--   end)
+
+-- ─── Config (Config.GridPanel) ────────────────────────────────────────────────
+local _cfgGP   = Config.GridPanel
+local _cfgGPBG = _cfgGP.background
+local _cfgGPGd = _cfgGP.grid
+local _cfgGPCr = _cfgGP.circle
+local _cfgGPTx = _cfgGP.text
+
+local _GP_BG  = { Dict = _cfgGP.sprite.dict,   Tex = _cfgGP.sprite.name,
+                  Y    = _cfgGPBG.offsetY,      H   = _cfgGPBG.height }
+local _GP_GRD = { Dict = _cfgGPGd.sprite.dict,  Tex = _cfgGPGd.sprite.name,
+                  Y    = _cfgGPGd.offsetY,       W   = _cfgGPGd.width,  H = _cfgGPGd.height }
+local _GP_CIR = { Dict = _cfgGPCr.sprite.dict,  Tex = _cfgGPCr.sprite.name,
+                  W    = _cfgGPCr.width,         H   = _cfgGPCr.height }
+local _GP_TXT = {
+    Top    = { Y = _cfgGPTx.top.offsetY,     Scale = _cfgGPTx.top.size    },
+    Bottom = { Y = _cfgGPTx.bottom.offsetY,  Scale = _cfgGPTx.bottom.size },
+    Left   = { X = _cfgGPTx.left.offsetX,   Y = _cfgGPTx.left.offsetY,   Scale = _cfgGPTx.left.size  },
+    Right  = { Y = _cfgGPTx.right.offsetY,  Scale = _cfgGPTx.right.size,  _padRight = _cfgGPTx.right.padRight },
+}
+local _GP_AREA_PAD = _cfgGP.areaPadding
+
+local _GP_WHITE = _cfgGP.color.text
+local _GP_TOTAL = _GP_BG.H + _GP_BG.Y
+
+---GridPanel conforme RageUI.GridPanel
+---@param X          number     valeur X [0.0, 1.0]
+---@param Y          number     valeur Y [0.0, 1.0]
+---@param TopText    string|nil
+---@param BottomText string|nil
+---@param LeftText   string|nil
+---@param RightText  string|nil
+---@param Callback   function   callback(hovered, active, x, y)
+---@param Index      number|nil
+function GridPanel(X, Y, TopText, BottomText, LeftText, RightText, Callback, Index)
+    if not _AmaUIPanelMenu then return end
+    if Index ~= nil and _AmaUIPanelMenu.currentItem ~= Index then return end
+
+    local mx    = _AmaUIPanelX
+    local my    = _AmaUIPanelY
+    local menuW = _AmaUIPanelMenu._menuWidth
+
+    -- Positions dynamiques (dépendent de la largeur du menu)
+    local grdX       = (menuW - _GP_GRD.W) * 0.5   -- grille centrée
+    local txtCenterX = menuW * 0.5                   -- labels Haut/Bas centrés
+    local txtRightX  = menuW - _GP_TXT.Right._padRight
+
+    -- Clamp X, Y dans [0.0, 1.0]
+    if X < 0.0 or X > 1.0 then X = 0.0 end
+    if Y < 0.0 or Y > 1.0 then Y = 0.0 end
+
+    local _pad  = _GP_AREA_PAD
+    local _pad2 = _pad * 2
+
+    -- Position du cercle
+    local CircleX = mx + grdX + _pad + ((_GP_GRD.W - _pad2) * X) - (_GP_CIR.W / 2)
+    local CircleY = my + _GP_GRD.Y + _pad + ((_GP_GRD.H - _pad2) * Y) - (_GP_CIR.H / 2)
+
+    -- ─── Background + grille ─────────────────────────────────────────────────
+    Draw.Sprite(_GP_BG.Dict,  _GP_BG.Tex,
+        mx, my + _GP_BG.Y, menuW, _GP_BG.H, 0, 255, 255, 255, 255)
+    Draw.Sprite(_GP_GRD.Dict, _GP_GRD.Tex,
+        mx + grdX, my + _GP_GRD.Y, _GP_GRD.W, _GP_GRD.H, 0, 255, 255, 255, 255)
+
+    -- ─── Interaction souris (style RageUI) ────────────────────────────────────
+    local areaLeft = mx + grdX + _pad
+    local areaTop  = my + _GP_GRD.Y + _pad
+    local areaW    = _GP_GRD.W - _pad2
+    local areaH    = _GP_GRD.H - _pad2
+
+    local mouseX = GetDisabledControlNormal(0, 239) * 1920
+    local mouseY = GetDisabledControlNormal(0, 240) * 1080
+
+    local Hovered = mouseX >= areaLeft and mouseX <= (areaLeft + areaW) and
+                    mouseY >= areaTop  and mouseY <= (areaTop  + areaH)
+    local Selected = false
+
+    if Hovered then
+        SetMouseCursorActiveThisFrame()
+        if IsDisabledControlPressed(0, 24) then
+            Selected = true
+            X = math.max(0.0, math.min(1.0, (mouseX - areaLeft) / areaW))
+            Y = math.max(0.0, math.min(1.0, (mouseY - areaTop)  / areaH))
+            CircleX = areaLeft + (areaW * X) - (_GP_CIR.W / 2)
+            CircleY = areaTop  + (areaH * Y) - (_GP_CIR.H / 2)
+        end
+    end
+
+    -- ─── Cercle curseur (position initiale ou mise à jour par la souris) ──────
+    Draw.Sprite(_GP_CIR.Dict, _GP_CIR.Tex,
+        CircleX, CircleY, _GP_CIR.W, _GP_CIR.H, 0, 255, 255, 255, 255)
+
+    -- ─── Labels directionnels ─────────────────────────────────────────────────
+    Text.Draw(TopText    or "", mx + txtCenterX,        my + _GP_TXT.Top.Y,    0, _GP_TXT.Top.Scale,    _GP_WHITE, 1)
+    Text.Draw(BottomText or "", mx + txtCenterX,        my + _GP_TXT.Bottom.Y, 0, _GP_TXT.Bottom.Scale, _GP_WHITE, 1)
+    Text.Draw(LeftText   or "", mx + _GP_TXT.Left.X,   my + _GP_TXT.Left.Y,   0, _GP_TXT.Left.Scale,   _GP_WHITE, 1)
+    Text.Draw(RightText  or "", mx + txtRightX,         my + _GP_TXT.Right.Y,  0, _GP_TXT.Right.Scale,  _GP_WHITE, 1)
+
+    -- Avance le curseur Y pour le prochain panel
+    _AmaUIPanelY = _AmaUIPanelY + _GP_TOTAL
+
+    if Callback then
+        Callback(Hovered, Selected, X, Y)
+    end
+end
+
+-- panels/grid_panel_h.lua
+-- GridPanelH conforme à RageUI.GridPanelHorizontal (UIGridPanelHorizontal.lua)
+--
+-- Signature : GridPanelH(x, leftText, rightText, callback, index)
+-- callback(hovered, active, x)  — x dans [0.0, 1.0], Y fixé à 0.5
+--
+-- Sprite grille : RageUI/horizontal_grid (axe X uniquement)
+-- Sprite cercle : mpinventory/in_world_circle
+-- Labels : Left(57.75, 130)  Right(373.25, 130)  — PAS de Top/Bottom
+--
+-- Utilisation typique (dans menu:SetPanels) :
+--   local gx = 0.5
+--   menu:SetPanels(function()
+--       GridPanelH(gx, "Ouverts", "Plissés", function(h, a, nx)
+--           gx = nx
+--       end, 1)
+--   end)
+
+-- ─── Config (Config.GridPanelH) ───────────────────────────────────────────────
+local _cfgGPH   = Config.GridPanelH
+local _cfgGPHBG = _cfgGPH.background
+local _cfgGPHGd = _cfgGPH.grid
+local _cfgGPHCr = _cfgGPH.circle
+local _cfgGPHTx = _cfgGPH.text
+
+local _GPH_BG  = { Dict = _cfgGPH.sprite.dict,   Tex = _cfgGPH.sprite.name,
+                   Y    = _cfgGPHBG.offsetY,      H   = _cfgGPHBG.height }
+local _GPH_GRD = { Dict = _cfgGPHGd.sprite.dict,  Tex = _cfgGPHGd.sprite.name,
+                   Y    = _cfgGPHGd.offsetY,       W   = _cfgGPHGd.width,  H = _cfgGPHGd.height }
+local _GPH_CIR = { Dict = _cfgGPHCr.sprite.dict,  Tex = _cfgGPHCr.sprite.name,
+                   W    = _cfgGPHCr.width,         H   = _cfgGPHCr.height }
+local _GPH_TXT = {
+    Left  = { X = _cfgGPHTx.left.offsetX,  Y = _cfgGPHTx.left.offsetY,  Scale = _cfgGPHTx.left.size  },
+    Right = { Y = _cfgGPHTx.right.offsetY, Scale = _cfgGPHTx.right.size, _padRight = _cfgGPHTx.right.padRight },
+}
+local _GPH_AREA_PAD = _cfgGPH.areaPadding
+
+local _GPH_WHITE = _cfgGPH.color.text
+local _GPH_TOTAL = _GPH_BG.H + _GPH_BG.Y
+
+---GridPanelH conforme RageUI.GridPanelHorizontal
+---@param X         number     valeur X [0.0, 1.0]
+---@param LeftText  string|nil label gauche
+---@param RightText string|nil label droite
+---@param Callback  function   callback(hovered, active, x)
+---@param Index     number|nil
+function GridPanelH(X, LeftText, RightText, Callback, Index)
+    if not _AmaUIPanelMenu then return end
+    if Index ~= nil and _AmaUIPanelMenu.currentItem ~= Index then return end
+
+    local mx    = _AmaUIPanelX
+    local my    = _AmaUIPanelY
+    local menuW = _AmaUIPanelMenu._menuWidth
+
+    -- Positions dynamiques
+    local grdX      = (menuW - _GPH_GRD.W) * 0.5   -- grille centrée
+    local txtRightX = menuW - _GPH_TXT.Right._padRight
+
+    if X < 0.0 or X > 1.0 then X = 0.0 end
+    local Y = 0.5  -- axe Y fixe au centre
+
+    local _pad  = _GPH_AREA_PAD
+    local _pad2 = _pad * 2
+
+    -- Position du cercle
+    local CircleX = mx + grdX + _pad + ((_GPH_GRD.W - _pad2) * X) - (_GPH_CIR.W / 2)
+    local CircleY = my + _GPH_GRD.Y + _pad + ((_GPH_GRD.H - _pad2) * Y) - (_GPH_CIR.H / 2)
+
+    -- ─── Background sprite ────────────────────────────────────────────────────
+    Draw.Sprite(_GPH_BG.Dict,  _GPH_BG.Tex,
+        mx, my + _GPH_BG.Y, menuW, _GPH_BG.H, 0, 255, 255, 255, 255)
+
+    -- ─── Sprite grille horizontale ────────────────────────────────────────────
+    Draw.Sprite(_GPH_GRD.Dict, _GPH_GRD.Tex,
+        mx + grdX, my + _GPH_GRD.Y, _GPH_GRD.W, _GPH_GRD.H, 0, 255, 255, 255, 255)
+
+    -- ─── Interaction souris (axe X uniquement) ────────────────────────────────
+    local areaLeft = mx + grdX + _pad
+    local areaTop  = my + _GPH_GRD.Y + _pad
+    local areaW    = _GPH_GRD.W - _pad2
+    local areaH    = _GPH_GRD.H - _pad2
+
+    local mouseX = GetDisabledControlNormal(0, 239) * 1920
+    local mouseY = GetDisabledControlNormal(0, 240) * 1080
+
+    local Hovered = mouseX >= areaLeft and mouseX <= (areaLeft + areaW) and
+                    mouseY >= areaTop  and mouseY <= (areaTop  + areaH)
+    local Selected = false
+
+    if Hovered then
+        SetMouseCursorActiveThisFrame()
+        if IsDisabledControlPressed(0, 24) then
+            Selected = true
+            X = math.max(0.0, math.min(1.0, (mouseX - areaLeft) / areaW))
+            CircleX = areaLeft + (areaW * X) - (_GPH_CIR.W / 2)
+            -- CircleY inchangé (Y fixe à 0.5)
+        end
+    end
+
+    -- ─── Cercle curseur (position mise à jour si drag) ────────────────────────
+    Draw.Sprite(_GPH_CIR.Dict, _GPH_CIR.Tex,
+        CircleX, CircleY, _GPH_CIR.W, _GPH_CIR.H, 0, 255, 255, 255, 255)
+
+    -- ─── Labels gauche / droite (PAS de Top/Bottom) ───────────────────────────
+    Text.Draw(LeftText  or "", mx + _GPH_TXT.Left.X, my + _GPH_TXT.Left.Y,  0, _GPH_TXT.Left.Scale,  _GPH_WHITE, 1)
+    Text.Draw(RightText or "", mx + txtRightX,        my + _GPH_TXT.Right.Y, 0, _GPH_TXT.Right.Scale, _GPH_WHITE, 1)
+
+    -- Avance le curseur Y pour le prochain panel
+    _AmaUIPanelY = _AmaUIPanelY + _GPH_TOTAL
+
+    if Callback then
+        Callback(Hovered, Selected, X)
+    end
+end
+
+-- panels/grid_panel_v.lua
+-- GridPanelV conforme à RageUI.GridPanelVertical (UIGridPanelVertical.lua)
+--
+-- Signature : GridPanelV(y, topText, bottomText, callback, index)
+-- callback(hovered, active, y)  — y dans [0.0, 1.0], X fixé à 0.5
+--
+-- Sprite grille : RageUI/vertical_grid (axe Y uniquement)
+-- Sprite cercle : mpinventory/in_world_circle
+-- Labels : Top(215.5, 15)  Bottom(215.5, 250)  — PAS de Left/Right
+--
+-- Utilisation typique (dans menu:SetPanels) :
+--   local gy = 0.5
+--   menu:SetPanels(function()
+--       GridPanelV(gy, "Haut", "Bas", function(h, a, ny)
+--           gy = ny
+--       end, 4)
+--   end)
+
+-- ─── Config (Config.GridPanelV) ───────────────────────────────────────────────
+local _cfgGPV   = Config.GridPanelV
+local _cfgGPVBG = _cfgGPV.background
+local _cfgGPVGd = _cfgGPV.grid
+local _cfgGPVCr = _cfgGPV.circle
+local _cfgGPVTx = _cfgGPV.text
+
+local _GPV_BG  = { Dict = _cfgGPV.sprite.dict,   Tex = _cfgGPV.sprite.name,
+                   Y    = _cfgGPVBG.offsetY,      H   = _cfgGPVBG.height }
+local _GPV_GRD = { Dict = _cfgGPVGd.sprite.dict,  Tex = _cfgGPVGd.sprite.name,
+                   Y    = _cfgGPVGd.offsetY,       W   = _cfgGPVGd.width,  H = _cfgGPVGd.height }
+local _GPV_CIR = { Dict = _cfgGPVCr.sprite.dict,  Tex = _cfgGPVCr.sprite.name,
+                   W    = _cfgGPVCr.width,         H   = _cfgGPVCr.height }
+local _GPV_TXT = {
+    Top    = { Y = _cfgGPVTx.top.offsetY,    Scale = _cfgGPVTx.top.size    },
+    Bottom = { Y = _cfgGPVTx.bottom.offsetY, Scale = _cfgGPVTx.bottom.size },
+}
+local _GPV_AREA_PAD = _cfgGPV.areaPadding
+
+local _GPV_WHITE = _cfgGPV.color.text
+local _GPV_TOTAL = _GPV_BG.H + _GPV_BG.Y
+
+---GridPanelV conforme RageUI.GridPanelVertical
+---@param Y          number     valeur Y [0.0, 1.0]
+---@param TopText    string|nil label haut
+---@param BottomText string|nil label bas
+---@param Callback   function   callback(hovered, active, y)
+---@param Index      number|nil
+function GridPanelV(Y, TopText, BottomText, Callback, Index)
+    if not _AmaUIPanelMenu then return end
+    if Index ~= nil and _AmaUIPanelMenu.currentItem ~= Index then return end
+
+    local mx    = _AmaUIPanelX
+    local my    = _AmaUIPanelY
+    local menuW = _AmaUIPanelMenu._menuWidth
+
+    -- Positions dynamiques
+    local grdX       = (menuW - _GPV_GRD.W) * 0.5   -- grille centrée
+    local txtCenterX = menuW * 0.5                    -- labels Haut/Bas centrés
+
+    if Y < 0.0 or Y > 1.0 then Y = 0.0 end
+    local X = 0.5  -- axe X fixe au centre
+
+    local _pad  = _GPV_AREA_PAD
+    local _pad2 = _pad * 2
+
+    -- Position du cercle
+    local CircleX = mx + grdX + _pad + ((_GPV_GRD.W - _pad2) * X) - (_GPV_CIR.W / 2)
+    local CircleY = my + _GPV_GRD.Y + _pad + ((_GPV_GRD.H - _pad2) * Y) - (_GPV_CIR.H / 2)
+
+    -- ─── Background sprite ────────────────────────────────────────────────────
+    Draw.Sprite(_GPV_BG.Dict,  _GPV_BG.Tex,
+        mx, my + _GPV_BG.Y, menuW, _GPV_BG.H, 0, 255, 255, 255, 255)
+
+    -- ─── Sprite grille verticale ──────────────────────────────────────────────
+    Draw.Sprite(_GPV_GRD.Dict, _GPV_GRD.Tex,
+        mx + grdX, my + _GPV_GRD.Y, _GPV_GRD.W, _GPV_GRD.H, 0, 255, 255, 255, 255)
+
+    -- ─── Interaction souris (axe Y uniquement) ────────────────────────────────
+    local areaLeft = mx + grdX + _pad
+    local areaTop  = my + _GPV_GRD.Y + _pad
+    local areaW    = _GPV_GRD.W - _pad2
+    local areaH    = _GPV_GRD.H - _pad2
+
+    local mouseX = GetDisabledControlNormal(0, 239) * 1920
+    local mouseY = GetDisabledControlNormal(0, 240) * 1080
+
+    local Hovered = mouseX >= areaLeft and mouseX <= (areaLeft + areaW) and
+                    mouseY >= areaTop  and mouseY <= (areaTop  + areaH)
+    local Selected = false
+
+    if Hovered then
+        SetMouseCursorActiveThisFrame()
+        if IsDisabledControlPressed(0, 24) then
+            Selected = true
+            Y = math.max(0.0, math.min(1.0, (mouseY - areaTop) / areaH))
+            CircleY = areaTop + (areaH * Y) - (_GPV_CIR.H / 2)
+            -- CircleX inchangé (X fixe à 0.5)
+        end
+    end
+
+    -- ─── Cercle curseur (position mise à jour si drag) ────────────────────────
+    Draw.Sprite(_GPV_CIR.Dict, _GPV_CIR.Tex,
+        CircleX, CircleY, _GPV_CIR.W, _GPV_CIR.H, 0, 255, 255, 255, 255)
+
+    -- ─── Labels haut / bas (PAS de Left/Right) ────────────────────────────────
+    Text.Draw(TopText    or "", mx + txtCenterX, my + _GPV_TXT.Top.Y,    0, _GPV_TXT.Top.Scale,    _GPV_WHITE, 1)
+    Text.Draw(BottomText or "", mx + txtCenterX, my + _GPV_TXT.Bottom.Y, 0, _GPV_TXT.Bottom.Scale, _GPV_WHITE, 1)
+
+    -- Avance le curseur Y pour le prochain panel
+    _AmaUIPanelY = _AmaUIPanelY + _GPV_TOTAL
+
+    if Callback then
+        Callback(Hovered, Selected, Y)
+    end
+end
+-- panels/percentage_panel.lua
+-- PercentagePanel conforme à RageUI.PercentagePanel (UIPercentagePanel.lua)
+--
+-- Signature : PercentagePanel(percent, headerText, minText, maxText, callback, index)
+-- callback(hovered, active, percent)
+--
+-- percent  : [0.0, 1.0]
+-- Barre fond : DrawRect RGB(87,87,87), W=413px
+-- Barre fill : DrawRect RGB(245,245,245), W=percent*413
+--
+-- Utilisation typique (dans menu:SetPanels) :
+--   local pct = 0.5
+--   menu:SetPanels(function()
+--       PercentagePanel(pct, "Opacity", "0%", "100%", function(h, a, newPct)
+--           pct = newPct
+--       end, 7)
+--   end)
+
+-- ─── Config (Config.PercentagePanel) ──────────────────────────────────────────
+local _cfgPP = Config.PercentagePanel
+
+local _PP_BG  = { Dict = _cfgPP.sprite.dict, Tex = _cfgPP.sprite.name,
+                  Y    = _cfgPP.background.offsetY, H = _cfgPP.background.height }
+local _PP_BAR = { X = _cfgPP.bar.offsetX, Y = _cfgPP.bar.offsetY,
+                  H = _cfgPP.bar.height,  _padRight = _cfgPP.bar.padRight }
+local _PP_TXT = {
+    Left   = { X = _cfgPP.text.left.offsetX, Y = _cfgPP.text.left.offsetY,   Scale = _cfgPP.text.left.size   },
+    Middle = {                                Y = _cfgPP.text.middle.offsetY,  Scale = _cfgPP.text.middle.size },
+    Right  = {                                Y = _cfgPP.text.right.offsetY,   Scale = _cfgPP.text.right.size,
+               _padRight = _cfgPP.text.right.padRight },
+}
+
+local _PP_WHITE  = _cfgPP.color.text
+local _PP_BAR_BG = _cfgPP.color.barBg
+local _PP_BAR_FG = _cfgPP.color.barFill
+local _PP_TOTAL  = _PP_BG.H + _PP_BG.Y
+
+---PercentagePanel conforme RageUI.PercentagePanel
+---@param Percent    number     [0.0, 1.0]
+---@param HeaderText string|nil label centré (ex: "Opacity")
+---@param MinText    string|nil label gauche (ex: "0%", nil → "0%")
+---@param MaxText    string|nil label droite (ex: "100%", nil → "100%")
+---@param Callback   function   callback(hovered, active, percent)
+---@param Index      number|nil
+---@param MouseOnly  boolean|nil  true = navigation souris uniquement (désactive clavier ←→)
+function PercentagePanel(Percent, HeaderText, MinText, MaxText, Callback, Index, MouseOnly)
+    if not _AmaUIPanelMenu then return end
+    if Index ~= nil and _AmaUIPanelMenu.currentItem ~= Index then return end
+
+    local x     = _AmaUIPanelX
+    local y     = _AmaUIPanelY
+    local menuW = _AmaUIPanelMenu._menuWidth
+
+    -- Positions dynamiques (dépendent de la largeur du menu)
+    local barW     = menuW - _PP_BAR.X - _PP_BAR._padRight
+    local txtMidX  = menuW * 0.5
+    local txtRightX = menuW - _PP_TXT.Right._padRight
+
+    -- Clamp dans [0.0, 1.0]
+    if Percent < 0.0 then Percent = 0.0 elseif Percent > 1.0 then Percent = 1.0 end
+
+    -- ─── Background sprite ────────────────────────────────────────────────────
+    Draw.Sprite(_PP_BG.Dict, _PP_BG.Tex,
+        x, y + _PP_BG.Y, menuW, _PP_BG.H, 0, 255, 255, 255, 255)
+
+    -- ─── Barre fond (gris) ────────────────────────────────────────────────────
+    Draw.Rect(x + _PP_BAR.X, y + _PP_BAR.Y, barW, _PP_BAR.H, _PP_BAR_BG)
+
+    -- ─── Barre fill (blanc, proportionnelle) ──────────────────────────────────
+    local fillW = Percent * barW
+    if fillW > 0 then
+        Draw.Rect(x + _PP_BAR.X, y + _PP_BAR.Y, fillW, _PP_BAR.H, _PP_BAR_FG)
+    end
+
+    -- ─── Labels ───────────────────────────────────────────────────────────────
+    Text.Draw(HeaderText or "Opacity", x + txtMidX,           y + _PP_TXT.Middle.Y, 0, _PP_TXT.Middle.Scale, _PP_WHITE, 1)
+    Text.Draw(MinText    or "0%",      x + _PP_TXT.Left.X,    y + _PP_TXT.Left.Y,   0, _PP_TXT.Left.Scale,   _PP_WHITE, 1)
+    Text.Draw(MaxText    or "100%",    x + txtRightX,          y + _PP_TXT.Right.Y,  0, _PP_TXT.Right.Scale,  _PP_WHITE, 1)
+
+    -- ─── Navigation clavier ← → (style ColorPanel : IsControlJustPressed) ──────
+    -- IsControlJustPressed (non-disabled) évite le conflit avec navigation.lua
+    -- qui utilise IsDisabledControlJustPressed sur les mêmes controls 174/175.
+    local Hovered = false
+    local Active  = false
+
+    if not MouseOnly then
+        if IsControlJustPressed(0, 174) then       -- LEFT
+            Percent = math.max(0.0, Percent - 0.05)
+            Active  = true
+        elseif IsControlJustPressed(0, 175) then   -- RIGHT
+            Percent = math.min(1.0, Percent + 0.05)
+            Active  = true
+        end
+    end
+
+    -- ─── Interaction souris sur la barre (drag) ───────────────────────────────
+    local mouseX = GetDisabledControlNormal(0, 239) * 1920
+    local mouseY = GetDisabledControlNormal(0, 240) * 1080
+
+    local barLeft = x + _PP_BAR.X
+    local barTop  = y + _PP_BAR.Y
+    local overBar = mouseX >= barLeft and mouseX <= (barLeft + barW)
+                    and mouseY >= (barTop - 5) and mouseY <= (barTop + _PP_BAR.H + 5)
+
+    if overBar then
+        SetMouseCursorActiveThisFrame()
+        Hovered = true
+        if IsDisabledControlPressed(0, 24) then
+            Percent = math.max(0.0, math.min(1.0, (mouseX - barLeft) / barW))
+            Active  = true
+        end
+    end
+
+    -- Avance le curseur Y pour le prochain panel
+    _AmaUIPanelY = _AmaUIPanelY + _PP_TOTAL
+
+    if Callback then
+        Callback(Hovered, Active, Percent)
+    end
+end
+-- panels/statistics_panel.lua
+-- StatisticsPanel et StatisticsPanelAdvanced conformes à RageUI (UIStatisticsPanel.lua)
+-- Optimisé: buffer/flush (1 DrawRect fond pour N stats) + normInto sans allocation GC
+
+-- ─── Config depuis Config.StatisticsPanel (shared/config.lua) ────────────────
+-- barW calculé dynamiquement dans FlushStatBuffer : mw - _SP_BAR.X - _SP_BAR._padRight
+local _c   = Config.StatisticsPanel or {}
+local _cbg = _c.background or {}
+local _clb = _c.label      or {}
+local _cbar= _c.bar        or {}
+
+local _SP_BG  = { Y = _cbg.offsetY   or 4,  H = _cbg.rowHeight or 40 }
+local _SP_TXT = { X = _clb.offsetX   or 10, Y = _clb.offsetY   or 10, Scale = _clb.size or 0.26 }
+local _SP_BAR = { X = _cbar.offsetX  or 190, Y = _cbar.offsetY or 18,
+                  H = _cbar.height   or 6,  _padRight = _cbar.padRight or 11,
+                  divCount = _cbar.divCount or 4 }
+
+local _SP_BG_CLR  = _cbg.color    or { r = 0,   g = 0,   b = 0,   a = 170 }
+local _SP_BAR_BG  = _cbar.colorBg or { r = 87,  g = 87,  b = 87,  a = 255 }
+local _SP_BAR_FG  = _cbar.colorFill or { r = 255, g = 255, b = 255, a = 255 }
+local _SP_TXT_CLR = _clb.color    or { r = 245, g = 245, b = 245, a = 255 }
+local _SP_DIV_CLR = _cbar.colorDiv or { r = 0,   g = 0,   b = 0,   a = 255 }
+
+-- Table temporaire réutilisée pour dessiner les couleurs custom sans allocation GC
+local _fillColor = { r = 255, g = 255, b = 255, a = 255 }
+
+-- ─── Buffer/flush ─────────────────────────────────────────────────────────────
+-- Les slots sont pré-alloués et réutilisés entre les frames (zéro GC par frame).
+local _MAX_SLOTS = 16
+local _statSlots = {}
+for i = 1, _MAX_SLOTS do
+    _statSlots[i] = {
+        label    = "",
+        percent  = 0.0,
+        advanced = false,
+        -- couleur barre principale (StatisticsPanelAdvanced)
+        c1r = 255, c1g = 255, c1b = 255, c1a = 255,
+        -- portion secondaire
+        percent2 = 0.0,
+        c2r = 0,   c2g = 153, c2b = 204, c2a = 255,
+        c3r = 185, c3g = 0,   c3b = 0,   c3a = 255,
+    }
+end
+
+local _statCount = 0
+local _statBufX  = 0
+local _statBufY  = 0
+local _statBufMW = 431
+
+local function FlushStatBuffer()
+    if _statCount == 0 then return end
+
+    local x   = _statBufX
+    local y   = _statBufY
+    local mw  = _statBufMW
+    local n   = _statCount
+
+    -- Barre dynamique : s'adapte à la largeur du menu
+    local barX    = _SP_BAR.X
+    local barW    = mw - barX - _SP_BAR._padRight
+    local divN    = _SP_BAR.divCount              -- nombre de diviseurs
+    local divStep = barW / (divN + 1)             -- espacement entre diviseurs
+
+    -- ⚡ 1 seul DrawRect fond pour toutes les lignes empilées
+    Draw.Rect(x, y + _SP_BG.Y, mw, n * _SP_BG.H, _SP_BG_CLR)
+
+    for i = 1, n do
+        local s  = _statSlots[i]
+        local oy = (i - 1) * _SP_BG.H
+
+        -- Label
+        Text.Draw(s.label, x + _SP_TXT.X, y + _SP_TXT.Y + oy, 0, _SP_TXT.Scale, _SP_TXT_CLR, 0)
+
+        -- Barre fond (gris)
+        Draw.Rect(x + barX, y + _SP_BAR.Y + oy, barW, _SP_BAR.H, _SP_BAR_BG)
+
+        -- Barre fill principale
+        local fillW1 = s.percent * barW
+        if fillW1 > 0 then
+            if s.advanced then
+                _fillColor.r = s.c1r
+                _fillColor.g = s.c1g
+                _fillColor.b = s.c1b
+                _fillColor.a = s.c1a
+                Draw.Rect(x + barX, y + _SP_BAR.Y + oy, fillW1, _SP_BAR.H, _fillColor)
+            else
+                Draw.Rect(x + barX, y + _SP_BAR.Y + oy, fillW1, _SP_BAR.H, _SP_BAR_FG)
+            end
+        end
+
+        -- Portion secondaire (StatisticsPanelAdvanced uniquement)
+        if s.advanced and s.percent2 ~= 0 then
+            local fillW2 = s.percent2 * barW
+            local startX = x + barX + fillW1
+            if fillW2 > 0 then
+                _fillColor.r = s.c2r; _fillColor.g = s.c2g
+                _fillColor.b = s.c2b; _fillColor.a = s.c2a
+                Draw.Rect(startX, y + _SP_BAR.Y + oy, fillW2, _SP_BAR.H, _fillColor)
+            elseif fillW2 < 0 then
+                _fillColor.r = s.c3r; _fillColor.g = s.c3g
+                _fillColor.b = s.c3b; _fillColor.a = s.c3a
+                Draw.Rect(startX + fillW2, y + _SP_BAR.Y + oy, -fillW2, _SP_BAR.H, _fillColor)
+            end
+        end
+
+        -- Diviseurs proportionnels (divN sections égales)
+        for d = 1, divN do
+            Draw.Rect(x + barX + d * divStep, y + _SP_BAR.Y + oy, 2, _SP_BAR.H, _SP_DIV_CLR)
+        end
+    end
+
+    _statCount = 0
+end
+
+-- Exposer FlushStatBuffer comme _AmaUIPanelFlush (appelé depuis menu.lua:_DrawPanels)
+_AmaUIPanelFlush = FlushStatBuffer
+
+-- ─── StatisticsPanel ─────────────────────────────────────────────────────────
+---@param Percent number   [0.0, 1.0]
+---@param Label   string
+---@param Index   number|nil
+function StatisticsPanel(Percent, Label, Index)
+    if not _AmaUIPanelMenu then return end
+    if Index ~= nil and _AmaUIPanelMenu.currentItem ~= Index then return end
+
+    if _statCount == 0 then
+        _statBufX  = _AmaUIPanelX
+        _statBufY  = _AmaUIPanelY
+        _statBufMW = _AmaUIPanelMenu._menuWidth or 431
+    end
+
+    _statCount = _statCount + 1
+    if _statCount <= _MAX_SLOTS then
+        local s = _statSlots[_statCount]
+        s.label    = Label or ""
+        s.percent  = Percent or 0
+        s.advanced = false
+        s.percent2 = 0
+    end
+
+    _AmaUIPanelStatCount = _AmaUIPanelStatCount + 1
+end
+
+-- ─── StatisticsPanelAdvanced ─────────────────────────────────────────────────
+---@param Label    string
+---@param Percent  number          [0.0, 1.0]
+---@param RGBA1    table|nil       couleur principale {r,g,b,a} ou positional
+---@param Percent2 number|nil      portion secondaire (peut être négatif)
+---@param RGBA2    table|nil       couleur portion positive
+---@param RGBA3    table|nil       couleur portion négative
+---@param Index    number|nil
+function StatisticsPanelAdvanced(Label, Percent, RGBA1, Percent2, RGBA2, RGBA3, Index)
+    if not _AmaUIPanelMenu then return end
+    if Index ~= nil and _AmaUIPanelMenu.currentItem ~= Index then return end
+
+    if _statCount == 0 then
+        _statBufX  = _AmaUIPanelX
+        _statBufY  = _AmaUIPanelY
+        _statBufMW = _AmaUIPanelMenu._menuWidth or 431
+    end
+
+    -- Valeurs par défaut (sans création de table)
+    local r1, g1, b1, a1 = 255, 255, 255, 255
+    local r2, g2, b2, a2 = 0,   153, 204, 255
+    local r3, g3, b3, a3 = 185, 0,   0,   255
+
+    if RGBA1 then
+        r1 = RGBA1.r or RGBA1[1] or 255
+        g1 = RGBA1.g or RGBA1[2] or 255
+        b1 = RGBA1.b or RGBA1[3] or 255
+        a1 = RGBA1.a or RGBA1[4] or 255
+    end
+    if RGBA2 then
+        r2 = RGBA2.r or RGBA2[1] or 0
+        g2 = RGBA2.g or RGBA2[2] or 153
+        b2 = RGBA2.b or RGBA2[3] or 204
+        a2 = RGBA2.a or RGBA2[4] or 255
+    end
+    if RGBA3 then
+        r3 = RGBA3.r or RGBA3[1] or 185
+        g3 = RGBA3.g or RGBA3[2] or 0
+        b3 = RGBA3.b or RGBA3[3] or 0
+        a3 = RGBA3.a or RGBA3[4] or 255
+    end
+
+    _statCount = _statCount + 1
+    if _statCount <= _MAX_SLOTS then
+        local s = _statSlots[_statCount]
+        s.label    = Label or ""
+        s.percent  = Percent or 0
+        s.advanced = true
+        s.percent2 = Percent2 or 0
+        s.c1r = r1; s.c1g = g1; s.c1b = b1; s.c1a = a1
+        s.c2r = r2; s.c2g = g2; s.c2b = b2; s.c2a = a2
+        s.c3r = r3; s.c3g = g3; s.c3b = b3; s.c3a = a3
+    end
+
+    _AmaUIPanelStatCount = _AmaUIPanelStatCount + 1
+end
+
