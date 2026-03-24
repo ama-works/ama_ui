@@ -20,20 +20,24 @@ local function _fnDrawRawShadow(text, nx, ny, font, scale, r, g, b, a, alignment
 end
 
 
----@param title string
----@param subtitle string
----@param x number
----@param y number
--- CrÃ©er un nouveau menu
-function Menu.New(title, subtitle, x, y)
+---@param title      string
+---@param subtitle   string
+---@param x          number|nil
+---@param y          number|nil
+---@param headerDict string|nil
+---@param headerName string|nil
+function Menu.New(title, subtitle, x, y, headerDict, headerName)
     local self = setmetatable({}, Menu)
 
     -- ID unique
     self.id = GenerateUUID()
-    
+
     -- Proprieter de base
     self.title = title or "Menu"
     self.subtitle = subtitle or ""
+    -- Override sprite header (optionnel — nil = utilise Config.Header.sprite)
+    self._overrideHeaderDict = headerDict or nil
+    self._overrideHeaderName = headerName or nil
     self.visible = false
     
     -- Position
@@ -47,7 +51,9 @@ function Menu.New(title, subtitle, x, y)
     -- Note: les items sont stockÃ©s dans une table indexÃ©e de 1 Ã  n, oÃ¹ n est le nombre total d'items. L'index de chaque item dans cette table dÃ©termine sa position verticale dans le menu (en fonction de l'index du premier item affichÃ© et de l'espacement).
     -- Exemple: self.items[1] est le premier item, self.items[2] le deuxiÃ¨me, etc. Si self.currentItem = 1 et self.maxItemsOnScreen = 10, alors on affiche self.items[1] a self.items[10]. Si self.currentItem = 5, on peut afficher self.items[1] Ã  self.items[10] ou self.items[2] Ã  self.items[11], etc. en fonction de la logique de centrage.
     self.items = {}
-    self.currentItem = 1
+    self.currentItem   = 1
+    self.rememberIndex = false  -- si true : Close() sauvegarde la position, Open() la restaure
+    self._savedIndex   = nil
     self.minItem = 1
     self.maxItem = 10
     self.maxItemsOnScreen = 10
@@ -393,6 +399,16 @@ function Menu:Open()
         Glare.Init()
     end
 
+    -- Restaurer la position sauvegardée si rememberIndex est actif
+    if self.rememberIndex and self._savedIndex then
+        local saved = self._savedIndex
+        local item  = self.items[saved]
+        if item and not item.isSeparator and item.type ~= "window" then
+            self.currentItem = saved
+        end
+        self._savedIndex = nil
+    end
+
     -- Si currentItem pointe sur un item non-navigable (window/separator), corriger
     local cur = self.items[self.currentItem]
     if cur and (cur.isSeparator or cur.type == "window") then
@@ -407,6 +423,9 @@ end
 function Menu:Close()
     if not self.visible then return end  -- guard anti-double-close
     self.visible = false
+    if self.rememberIndex then
+        self._savedIndex = self.currentItem
+    end
     self.currentItem = self:_FirstNavigableIndex()
 
     -- Libère le scaleform glare si activé (économise le handle GPU)
@@ -615,9 +634,11 @@ function Menu:_Recalculate()
 
     -- 1. CACHE HEADER
     local hCfg = Config.Header
-    self._hSpriteUse = hCfg.sprite and hCfg.sprite.use
-    self._hSpriteDict = hCfg.sprite and hCfg.sprite.dict or "commonmenu"
-    self._hSpriteName = hCfg.sprite and hCfg.sprite.name or "interaction_bgd"
+    -- Override par-menu prioritaire sur Config.Header.sprite
+    local overrideSprite = self._overrideHeaderDict and self._overrideHeaderName
+    self._hSpriteUse  = overrideSprite or (hCfg.sprite and hCfg.sprite.use)
+    self._hSpriteDict = self._overrideHeaderDict or (hCfg.sprite and hCfg.sprite.dict or "commonmenu")
+    self._hSpriteName = self._overrideHeaderName or (hCfg.sprite and hCfg.sprite.name or "interaction_bgd")
     local hTint = hCfg.sprite and (hCfg.sprite.color or hCfg.sprite.tint) or {r=255,g=255,b=255,a=255}
     self._hSpriteR, self._hSpriteG, self._hSpriteB, self._hSpriteA = hTint.r, hTint.g, hTint.b, hCfg.sprite and hCfg.sprite.alpha or hTint.a
     
@@ -1007,21 +1028,22 @@ function Menu:_DrawHeader()
     if self._glareEnabled then
         Glare.Draw(self._glareX, self._glareY, self._glareW, self._glareH)
     end
-    if self._tShadow then
-        -- DrawRawShadow : positions normalisées + valeurs shadow aplaties, SetTextProportional inclus.
-        _fnDrawRawShadow(self.title,
-            self._titleNX, self._titleNY,
-            self._tFont, self._tScale,
-            self._tColor.r, self._tColor.g, self._tColor.b, self._tColor.a,
-            self._tAlign,
-            self._tShadowDist, self._tShadowR, self._tShadowG, self._tShadowB, self._tShadowA)
-    else
-        -- DrawRaw : positions normalisées + reset alignement état GTA.
-        _fnDrawRaw(self.title,
-            self._titleNX, self._titleNY,
-            self._tFont, self._tScale,
-            self._tColor.r, self._tColor.g, self._tColor.b, self._tColor.a,
-            self._tAlign)
+    -- Titre masqué si un sprite header custom est actif (bannière remplace le texte)
+    if not (self._overrideHeaderDict and self._overrideHeaderName) then
+        if self._tShadow then
+            _fnDrawRawShadow(self.title,
+                self._titleNX, self._titleNY,
+                self._tFont, self._tScale,
+                self._tColor.r, self._tColor.g, self._tColor.b, self._tColor.a,
+                self._tAlign,
+                self._tShadowDist, self._tShadowR, self._tShadowG, self._tShadowB, self._tShadowA)
+        else
+            _fnDrawRaw(self.title,
+                self._titleNX, self._titleNY,
+                self._tFont, self._tScale,
+                self._tColor.r, self._tColor.g, self._tColor.b, self._tColor.a,
+                self._tAlign)
+        end
     end
 end
 

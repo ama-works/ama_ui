@@ -88,12 +88,25 @@ end
 --- Retourne un proxy avec méthodes directes pour compatibilité cross-resource.
 ---@param title    string
 ---@param subtitle string
----@param opts     table|nil   { x=number, y=number }
+---@param opts     table|string|nil   table { x, y, dict, name } OU string dict (positional)
+---@param nameArg  string|nil         name du sprite si opts est un string dict
 ---@return table proxy
-function ama_ui.CreateMenu(title, subtitle, opts)
-    local x = opts and opts.x or nil
-    local y = opts and opts.y or nil
-    local menu = Menu.New(title, subtitle, x, y)
+--- Supporte deux syntaxes :
+---   ama_ui.CreateMenu("Titre", "Sub", { dict="commonmenu", name="interaction_bgd" })
+---   ama_ui.CreateMenu("Titre", "Sub", "commonmenu", "interaction_bgd")
+function ama_ui.CreateMenu(title, subtitle, opts, nameArg)
+    local x, y, dict, name
+    if type(opts) == "string" then
+        -- Syntaxe positionnelle : CreateMenu(title, sub, dict, name)
+        dict = opts
+        name = nameArg
+    else
+        x    = opts and opts.x    or nil
+        y    = opts and opts.y    or nil
+        dict = opts and opts.dict or nil
+        name = opts and opts.name or nil
+    end
+    local menu = Menu.New(title, subtitle, x, y, dict, name)
     MenuPool.Add(menu)
     _menuRegistry[menu.id] = menu
 
@@ -144,13 +157,14 @@ function ama_ui.CreateMenu(title, subtitle, opts)
 end
 
 --- Crée un sous-menu lié à un menu parent.
----@param parent   table   proxy ou menu réel
+---@param parent   table        proxy ou menu réel
 ---@param title    string
 ---@param subtitle string
----@param opts     table|nil
+---@param opts     table|string|nil   table { dict, name } OU string dict (positional)
+---@param nameArg  string|nil         name du sprite si opts est un string dict
 ---@return table proxy
-function ama_ui.CreateSubMenu(parent, title, subtitle, opts)
-    local sub = ama_ui.CreateMenu(title, subtitle, opts)
+function ama_ui.CreateSubMenu(parent, title, subtitle, opts, nameArg)
+    local sub = ama_ui.CreateMenu(title, subtitle, opts, nameArg)
     local parentId = type(parent) == "table" and parent.id or nil
     local realParent = (parentId and _menuRegistry[parentId]) or parent
     local realSub    = _menuRegistry[sub.id]
@@ -194,6 +208,7 @@ function ama_ui.IsVisible(menuOrProxy)
     local menu = (id and _menuRegistry[id]) or menuOrProxy
     return menu ~= nil and menu.visible == true
 end
+
 
 -- ============================================================================
 -- PANELS — accessibles via getSharedObject

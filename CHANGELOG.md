@@ -1,5 +1,34 @@
 # ama_ui — Changelog
 
+## 2026-03-24
+
+### Feature — core/menu.lua (rememberIndex)
+
+- Nouvelle option `rememberIndex` (false par défaut) sur chaque menu/submenu
+- Quand activée : `Close()` sauvegarde la position courante dans `_savedIndex`, `Open()` la restaure si l'item est toujours navigable
+- Usage : `menu.rememberIndex = true` — fonctionne sur menus et submenus via le proxy existant
+- Comportement par défaut inchangé (reset au premier item navigable)
+
+### Feature — core/menu.lua (masquage titre avec header custom)
+
+- Quand `dict`/`name` override sont définis sur un menu, le texte du titre n'est plus dessiné dans `_DrawHeader()`
+- Comportement identique à NativeUI/RageUI : la bannière image remplace le titre texte
+
+### Feature — ui/ui.lua (CreateSubMenu — syntaxe positionnelle dict/name)
+
+- `CreateSubMenu` accepte maintenant un 5ème paramètre `nameArg` pour la syntaxe positionnelle :
+  `ama_ui.CreateSubMenu(parent, "Titre", "Sub", "dict", "name")`
+- Syntaxe table déjà supportée reste valide : `{ dict = "...", name = "..." }`
+
+### Feature — ui/ui.lua + core/menu.lua (CreateMenu — dict/name header custom)
+
+- `CreateMenu` supporte deux syntaxes pour le sprite header :
+  - Table : `CreateMenu("T", "S", { dict = "commonmenu", name = "interaction_bgd" })`
+  - Positionnelle : `CreateMenu("T", "S", "commonmenu", "interaction_bgd")`
+- `Menu.New` stocke `_overrideHeaderDict/_overrideHeaderName` avec priorité sur `Config.Header.sprite`
+
+---
+
 ## 2026-03-21
 
 ### Fix — shared/config.lua (collision Config cross-resource)
